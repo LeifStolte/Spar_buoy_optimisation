@@ -1,74 +1,69 @@
-'''
-Filename: c:\\Users\\fabpi\\modules\\46211assignmentsolution\\src\\assignmentcode\\edition2024\\python\\runner.py
-Path: c:\\Users\\fabpi\\modules\\46211assignmentsolution\\src\\assignmentcode\\edition2024\\python
-Created Date: Saturday, October 12th 2024, 8:27:19 am
-Author: Fabio Pierella
+import numpy as np
 
-Copyright (c) 2024 DTU Wind and Energy Systems
-'''
+from common import downsample, generateRandomPhases
+from integration import dqdt, ode4
+from loads import calculateDynamicLoads, calculateStaticWaveLoads, calculateStaticWindLoads
+from models import LoadSeries, Response, Structure, TimeInfo
+from monopile import computeElementwiseQuantities
+from rotor import Rotor
+from waves import Waves
+from wind import Wind
 
-from waves import *
-from wind import *
-from common import *
-from monopile import *
-from rotor import *
-from integration import ode4, dqdt
-from loads import *
 
 def runEnvironmentalCondition(wind, waves, rotor, monopile, timeInfo):
-    
-    # Load time info and calculate time vector
-    waves.update(timeInfo); wind.update(timeInfo)
-    waves["t"] = np.arange(0., waves["TDur"], waves["dt"])
-    wind["t"] = np.arange(0., wind["TDur"], wind["dt"])
-    
-    # Calculate wind 
-    wind = calculateKaimalSpectrum(wind)
-    wind = generateRandomPhases(wind, seed=wind["randomSeed"])
-    # Note: replace with slow version if the FFT one does not work
-    wind = calculateWindTimeSeriesFFT(wind)
-    
-    # Calcualte waves
-    waves = calculateJONSWAPSpectrum(waves)
-    waves = generateRandomPhases(waves, seed=waves["randomSeed"])
-    # Note: replace with slow version if the FFT one does not work
-    waves = calculateFreeSurfaceElevationTimeSeriesFFT(waves)
-    waves = calculateKinematicsFFT(waves)
-            
-    # Calculate response    
-    q0 = [0., 0.]
-    tIntegration = np.arange(0., timeInfo["TDur"], 2*timeInfo["dt"])
-    q = ode4(dqdt, tIntegration, q0, monopile, rotor,
-                waves, wind)
-    
-    # Save it into dict
-    response = dict()
-    response["t"] = tIntegration
-    response["alphaDot"] = q[:,1]
-    response["alphaDotDot"] = np.gradient(q[:,1], tIntegration)
-    
-    # Calculate the moments
-    windDownsampled = downsample(wind, dropEvery=2, listOfFields=["t", "V_hub"])
-    windLoads = calculateStaticWindLoads(windDownsampled, rotor, 
-                                    monopile, response)
+    if not hasattr(wind, "copy_with"):
+        wind = Wind.from_mapping(wind)
+    if not hasattr(waves, "copy_with"):
+        waves = Waves.from_mapping(waves)
+    if not hasattr(rotor, "copy_with"):
+        rotor = Rotor.from_mapping(rotor)
+    if not hasattr(monopile, "copy_with"):
+        monopile = Structure.from_mapping(monopile)
+    if not hasattr(timeInfo, "copy_with"):
+        timeInfo = TimeInfo.from_mapping(timeInfo)
 
-    # Calculate the static wave loads
-    wavesDownsampled = downsample(waves, dropEvery=2, listOfFields=["t", "u", "ut", "eta"])
-    waveLoads = calculateStaticWaveLoads(wavesDownsampled, monopile, response)
+    waves = waves.copy_with(TDur=timeInfo.TDur, fHighCut=timeInfo.fHighCut)
+    wind = wind.copy_with(TDur=timeInfo.TDur, fHighCut=timeInfo.fHighCut)
+    waves.t = np.arange(0.0, timeInfo.TDur, timeInfo.dt)
+    wind.t = np.arange(0.0, timeInfo.TDur, timeInfo.dt)
 
-    # Calculate the dynamic loads
+    wind = wind.calculate_kaimal_spectrum()
+    wind = wind.generate_random_phases(seed=wind.randomSeed)
+    wind = wind.calculate_time_series_fft()
+
+    waves = waves.calculate_jonswap_spectrum()
+    waves = generateRandomPhases(waves, seed=waves.randomSeed)
+    waves = waves.calculate_free_surface_elevation_time_series_fft()
+    waves = waves.calculate_kinematics_fft()
+
+    q0 = [0.0, 0.0]
+    t_integration = np.arange(0.0, timeInfo.TDur, 2 * timeInfo.dt)
+    q = ode4(dqdt, t_integration, q0, monopile, rotor, waves, wind)
+
+    response = Response(
+        t=t_integration,
+        alphaDot=q[:, 1],
+        alphaDotDot=np.gradient(q[:, 1], t_integration),
+    )
+
+    wind_downsampled = downsample(wind, dropEvery=2, listOfFields=["t", "V_hub"])
+    wind_loads = calculateStaticWindLoads(wind_downsampled, rotor, monopile, response)
+
+    waves_downsampled = downsample(waves, dropEvery=2, listOfFields=["t", "u", "ut", "eta"])
+    wave_loads = calculateStaticWaveLoads(waves_downsampled, monopile, response)
+
     monopile = computeElementwiseQuantities(monopile)
-    dynamicLoads = calculateDynamicLoads(monopile, response)
-    
-    outputDict = {}
-    outputDict["waves"] = waveLoads
-    outputDict["wind"] = windLoads
-    outputDict["dynamic"] = dynamicLoads
-    
-    # Compute the total overturning moment
-    outputDict["total"] = dict()
-    outputDict["total"]["t"] = waveLoads["t"].copy()
-    outputDict["total"]["F"] = waveLoads["F"] + windLoads["F"] + dynamicLoads["F"]
-    outputDict["total"]["M"] = waveLoads["M"] + windLoads["M"] + dynamicLoads["M"]
-    
-    return outputDict
+    dynamic_loads = calculateDynamicLoads(monopile, response)
+
+    output = {
+        "waves": wave_loads,
+        "wind": wind_loads,
+        "dynamic": dynamic_loads,
+    }
+    output["total"] = LoadSeries(
+        t=wave_loads.t.copy(),
+        F=wave_loads.F + wind_loads.F + dynamic_loads.F,
+        M=wave_loads.M + wind_loads.M + dynamic_loads.M,
+    )
+
+    return output

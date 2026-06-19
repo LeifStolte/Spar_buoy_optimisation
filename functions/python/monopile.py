@@ -1,52 +1,65 @@
-import numpy as np
-from common import loadConstants
+from dataclasses import dataclass
 
-g = loadConstants()["g"]
-rho_water = loadConstants()["rho_water"]
+import numpy as np
+
+from common import loadConstants
+from models import Model
+
+
+g = loadConstants().g
+rho_water = loadConstants().rho_water
+
+
+@dataclass
+class Monopile(Model):
+    DMonopile: float = 0.0
+    CD: float = 0.0
+    CM: float = 0.0
+    zBeamNodal: any = None
+    phiNodal: any = None
+    rhoAElement: any = None
+    zBeamElement: any = None
+    dz: any = None
+    phiElement: any = None
+
+    def force_integrate(self, u, ut, z, x_dot):
+        h = np.abs(z[0])
+        u = u - x_dot
+        df = self.force_distributed(u, ut, z, x_dot)
+        F = np.trapz(df, z)
+        M = np.trapz(df * (h + z), z)
+        return F, M
+
+    def force_distributed(self, u, ut, z, x_dot):
+        del z
+        u = u - x_dot
+        df_drag = 0.5 * rho_water * self.DMonopile * self.CD * np.abs(u) * u
+        df_inertia = rho_water * self.CM * (np.pi / 4) * self.DMonopile ** 2 * ut
+        return df_drag + df_inertia
+
+    def compute_elementwise_quantities(self):
+        z = self.zBeamNodal
+        dz = np.diff(z)
+        self.zBeamElement = z[:-1] + dz / 2
+        self.dz = dz
+
+        phi = self.phiNodal
+        dPhi = np.diff(phi)
+        self.phiElement = self.phiNodal[:-1] + dPhi / 2
+        return self
+
 
 def forceIntegrate(monopileDict, u, ut, z, x_dot):
-    
-    h = np.abs(z[0])
-    u = u - x_dot
-    
-    df = forceDistributed(monopileDict, u, ut, z, x_dot)
+    monopile = monopileDict if isinstance(monopileDict, Monopile) else Monopile.from_mapping(monopileDict.to_mapping() if hasattr(monopileDict, "to_mapping") else monopileDict)
+    return monopile.force_integrate(u, ut, z, x_dot)
 
-   
-    F = np.trapz(df, z)
-    # FIXME Assignment 1 Q6:  
-    # Calculate the moment as well
-    
-    dM = df*(h + z) # get zphys from wavesQ@ dictionary
-    M = np.trapz(dM, z)
-    
-    return F, M
 
 def forceDistributed(monopileDict, u, ut, z, x_dot):
-    
-    u = u - x_dot
-    
-    # FIXME Assignment 1 Q2.3:  add back the inertia forces
-    df_drag = 0.5*rho_water*monopileDict["DMonopile"]*monopileDict["CD"]*np.abs(u)*u   # drag force
-    df_inertia = rho_water * monopileDict["CM"] * (np.pi/4)*monopileDict["DMonopile"]**2 * ut   # acceleration
-    df = df_drag + df_inertia
+    monopile = monopileDict if isinstance(monopileDict, Monopile) else Monopile.from_mapping(monopileDict.to_mapping() if hasattr(monopileDict, "to_mapping") else monopileDict)
+    return monopile.force_distributed(u, ut, z, x_dot)
 
-    return  df
 
 def computeElementwiseQuantities(monopileDict):
-    
-    outputDict = dict()
-    outputDict.update(monopileDict)
-    
-    # Compute missing element properties
-    z = monopileDict["zBeamNodal"]
-    dz = np.diff(z)
-    outputDict["zBeamElement"] = z[:-1] + dz/2
-    outputDict["dz"] = dz
-    
-    # Compute the phiNodal
-    phi = monopileDict["phiNodal"]
-    dPhi = np.diff(phi)
-    outputDict["phiElement"] = outputDict["phiNodal"][:-1] + dPhi/2
-    
-    return outputDict
+    monopile = monopileDict if isinstance(monopileDict, Monopile) else Monopile.from_mapping(monopileDict.to_mapping() if hasattr(monopileDict, "to_mapping") else monopileDict)
+    return monopile.compute_elementwise_quantities()
     

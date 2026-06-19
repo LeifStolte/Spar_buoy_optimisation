@@ -1,108 +1,86 @@
+from dataclasses import dataclass
+
 import numpy as np
+from typing import Any
+
+from models import Model
 
 
+@dataclass
+class Wind(Model):
+    TDur: Any = None
+    fHighCut: Any = None
+    I: Any = None
+    V_10: Any = None
+    l: Any = None
+    t: Any = None
+    Spectrum: Any = None
+    amplitudeSpectrum: Any = None
+    f: Any = None
+    randomPhases: Any = None
+    V_hub: Any = None
+    windTimeSeries: Any = None
+
+    def calculate_kaimal_spectrum(self):
+        df = self.TDur ** -1
+        f = np.arange(df, self.fHighCut, df)
+
+        spectrum = (4 * self.I ** 2 * self.V_10 * self.l) / (1 + 6 * f * self.l / self.V_10) ** (5 / 3)
+        amplitude_spectrum = np.sqrt(2 * spectrum * df)
+
+        self.Spectrum = spectrum
+        self.amplitudeSpectrum = amplitude_spectrum
+        self.f = f
+        return self
+
+    def generate_random_phases(self, seed=2):
+        numbers = np.ones(len(self.Spectrum))
+        numbers *= seed
+        for i in range(1, len(numbers)):
+            numbers[i] = (1103515245 * numbers[i - 1] + 12345) % (2 ** 31)
+        self.randomPhases = 2 * np.pi * np.array([value / (2 ** 31) for value in numbers])
+        return self
+
+    def calculate_time_series(self):
+        t = self.t
+        f = self.f
+        wind_time_series = np.zeros_like(t)
+
+        random_phases = self.randomPhases if hasattr(self, "randomPhases") else np.random.uniform(0, 2 * np.pi, size=len(f))
+
+        for i_, ti in enumerate(t):
+            wind_time_series[i_] = np.sum(self.amplitudeSpectrum * np.cos(2 * np.pi * f * ti + random_phases))
+
+        self.V_hub = wind_time_series + self.V_10
+        self.randomPhases = random_phases
+        self.windTimeSeries = wind_time_series
+        return self
+
+    def calculate_time_series_fft(self):
+        t = self.t
+        f = self.f
+
+        M = len(t)
+        wind_time_series_kernel = np.zeros(M, dtype=complex)
+        for i in range(len(f)):
+            amplitude_spectrum = self.amplitudeSpectrum[i]
+            random_phases = self.randomPhases[i]
+
+            if i + 1 < M:
+                wind_time_series_kernel[i + 1] = amplitude_spectrum * np.exp(1j * random_phases)
+
+        wind_time_series = np.fft.ifft(wind_time_series_kernel, n=M).real * M
+        self.V_hub = wind_time_series + self.V_10
+        return self
 
 
 def calculateKaimalSpectrum(windDict):
-    
-    # Store it inside the wind dictionary
-    outputDict = dict()
-    outputDict.update(windDict)
-    
-    # Calculate frequency information
-    df = windDict["TDur"]**-1
-    f = np.arange(df, windDict["fHighCut"], df)
-
-    # Calculate the Kaimal spectrum
-    # FIXME Assignment 3 Q1.3: Program spectrum 
-    Spectrum = (4*windDict["I"]**2*windDict["V_10"]*windDict["l"])/(1+6*f*windDict["l"]/windDict["V_10"])**(5/3)
-    amplitudeSpectrum = np.sqrt(2*Spectrum*df)
-
-    outputDict["Spectrum"] = Spectrum
-    outputDict["amplitudeSpectrum"] = amplitudeSpectrum
-    outputDict["f"] = f
-    
-    return outputDict
-
+    return Wind.from_mapping(windDict).calculate_kaimal_spectrum()
 
 
 def calculateWindTimeSeries(windDict):
-    t = windDict["t"]
-    f = windDict["f"]
-    windTimeSeries = np.zeros_like(t)
-
-    
-    
-    if "randomPhases" in windDict:
-        randomPhases = windDict["randomPhases"]
-    else:
-        randomPhases = np.random.uniform(0, 2*np.pi, size=len(f))
-
-    
-
-    for i_, ti in enumerate(t):
-        # Sum over all frequency components for each time point
-        windTimeSeries[i_] = np.sum(
-            windDict["amplitudeSpectrum"] * np.cos(2*np.pi*f*ti + randomPhases)
-        )
-    
-    
-    
-    # Store the result
-    outputDict = dict()
-    outputDict.update(windDict)
-    outputDict["t"] = t
-    outputDict["V_hub"] = windTimeSeries + windDict["V_10"]
-    outputDict["randomPhases"] = randomPhases
-    outputDict["windTimeSeries"] = windTimeSeries
-    
-    
-    
-    return outputDict
+    return Wind.from_mapping(windDict).calculate_time_series()
 
 
 def calculateWindTimeSeriesFFT(windDict):
-    """
-    FFT-based wind time series calculation - optimized version of slow method.
-    
-    Implementation Success Factors:
-    ==============================
-    1. Sequential Frequency Placement: Wind spectrum frequencies map directly 
-       to FFT bins i+1, ensuring exact frequency grid matching.
-       
-    2. Proper FFT Bin Mapping: Each spectrum component at frequency f[i] goes 
-       into FFT bin [i+1], skipping the DC component at bin 0.
-       
-    3. Correct IFFT Scaling: Result scaled by M to match slow method amplitude 
-       convention, ensuring identical statistical properties.
-       
-    4. Amplitude Spectrum Usage: Uses amplitudeSpectrum (not power spectrum) 
-       with random phases to generate time series identical to slow method.
-    
-    Performance: ~200× faster than slow method while maintaining exact accuracy.
-    """
-    t = windDict["t"]
-    f = windDict["f"]
-    
-    M = len(t)
-    
-    WindTimeSeriesKernel = np.zeros(M, dtype=complex)
-    # FIXME Assignment 3 Q1.8: compute the fft kernel and perform the IFFT
-    for i in range(len(f)):
-        amplitudeSpectrum = windDict["amplitudeSpectrum"][i]
-        randomPhases = windDict["randomPhases"][i]
-        
-        # Place this component directly in bin i+1 (skip DC component at bin 0)
-        if i + 1 < M:
-            WindTimeSeriesKernel[i + 1] = (amplitudeSpectrum * 
-                                          np.exp(1j * randomPhases))
-    
-    WindTimeSeries = np.fft.ifft(WindTimeSeriesKernel, n=M).real * M
-    
-    # Store the result
-    outputDict = dict()
-    outputDict.update(windDict)
-    outputDict["t"] = t
-    outputDict["V_hub"] = WindTimeSeries + windDict["V_10"]
-    
-    return outputDict
+    return Wind.from_mapping(windDict).calculate_time_series_fft()
