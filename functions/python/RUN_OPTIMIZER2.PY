@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 from tqdm.auto import tqdm
+from types import SimpleNamespace
 
 from common import loadFromJSON, generateRandomPhases
 from waves import Waves
@@ -71,11 +72,10 @@ def _design_key(x):
 
 
 def _plot_diameter_profile(ax, structure, diameters, label, style='-'):
-    z_submerged = np.asarray(structure.z_edges_computed[:-1], dtype=float)
-    d_submerged = np.asarray(diameters, dtype=float).reshape(-1)
-
-    ax.step(d_submerged, z_submerged, style, where='post', label=label)
-    ax.axhline(0.0, color='k', linewidth=0.8, alpha=0.25)
+    z_edges = np.asarray(structure.z_edges_computed, dtype=float)
+    ax.step(diameters, z_edges[:-1], style, where='post', label=label)
+    ax.set_ylim([min(z_edges) - 5, 5]) 
+    ax.axhline(0.0, color='k', linewidth=0.8, alpha=0.5)
 
 def _get_weight_distribution(structure, D_nodes, L_fracs, ballast_mass, thickness=FIXED_THICKNESS):
     """Cumulative mass from the bottom upward: steel shell + ballast lump at the lowest node."""
@@ -254,11 +254,10 @@ def constraints_fun(x, waves, wind, t_integration, transient_time, surge_rms_max
     surge_rms = np.sqrt(np.mean(q[post_transient, 0] ** 2))
     pitch_rms = np.sqrt(np.mean((np.rad2deg(q[post_transient, 1])) ** 2))
 
-    # Clamp to [-3, ...] so unstable-simulation outliers don't wreck gradient estimation
     return np.array([
-        max(-3.0, (surge_rms_max - surge_rms) / surge_rms_max),
-        max(-3.0, (pitch_rms_max_deg - pitch_rms) / pitch_rms_max_deg),
-        (buoyancy_margin - FLOATING_MARGIN) / 1e6,
+        (surge_rms_max - surge_rms) / surge_rms_max,
+        (pitch_rms_max_deg - pitch_rms) / pitch_rms_max_deg,
+        buoyancy_margin / 1e7,  # Assuming ~10,000 tonnes
         (gm - GM_MIN) / GM_MIN
     ])
 
@@ -278,37 +277,118 @@ def _make_cached_evaluator(waves, wind, t_integration, transient_time, feval_pro
     return evaluate
 
 
-def execute_optimization_stage(x0, bounds, time_final, time_step, transient_time, maxiter, ftol, stage_name):
-    """Executes a single optimization flight profile stage with targeted environments."""
-    t_integration = np.arange(0.0, time_final, 2.0 * time_step)
-    integration_dt = 2.0 * time_step
-    
-    print(f"\n[{stage_name}] Pre-computing environmental conditions (T={time_final:.0f}s, dt={integration_dt:.2f}s)...")
+# ---------------------------------------------------------------------------
+# Environment cache helpers — single 1200 s realisation shared by both stages
+# ---------------------------------------------------------------------------
+_ENV_CACHE_DIR = os.path.join(BASE, 'assignment5', 'python', 'outputVariables')
+_ENV_DURATION  = 1200.0   # covers Stage 2; Stage 1 only uses the first 400 s
+_ENV_DT        = 1.0      # = 2 * time_step (time_step = 0.5 s)
+
+
+def _env_cache_path(prefix, seed, **extra):
+    """Return a deterministic .npz path based on generation parameters."""
+    os.makedirs(_ENV_CACHE_DIR, exist_ok=True)
+    tag = f"{prefix}_T{_ENV_DURATION:.0f}_dt{_ENV_DT:.4f}_seed{seed}"
+    for k, v in sorted(extra.items()):
+        tag += f"_{k}{v:.4g}"
+    return os.path.join(_ENV_CACHE_DIR, f"env_cache_{tag}.npz")
+
+
+def _load_or_compute_waves():
+    """Load or generate the 1200 s JONSWAP wave environment (cached to disk)."""
+    Hs   = SPAR0.get('significant_wave', 6.0)
+    Tp   = SPAR0.get('wave_period', 10.0)
+    h    = TIME_INFO.get('water_depth', 320.0)
+    seed = 2
+    t    = np.arange(0.0, _ENV_DURATION, _ENV_DT)
+    cache_file = _env_cache_path('waves', seed, Hs=Hs, Tp=Tp, h=h)
+
+    if os.path.exists(cache_file):
+        d = np.load(cache_file)
+        if 'eta' not in d.files:
+            os.remove(cache_file)  # stale cache without eta — regenerate
+        else:
+            return SimpleNamespace(t=d['t'], u=d['u'], ut=d['ut'], z=d['z'], eta=d['eta'])
+
     waves = Waves.from_mapping({
-        'Hs': SPAR0.get('significant_wave', 6.0),
-        'Tp': SPAR0.get('wave_period', 10.0),
-        'TDur': time_final,
-        'dt': integration_dt,
-        'fHighCut': 0.5,
-        'h': TIME_INFO.get('water_depth', 320.0),
-        'z': np.linspace(-MAX_DRAFT, 0.0, 120), 
-        't': t_integration,
+        'Hs': Hs, 'Tp': Tp, 'TDur': _ENV_DURATION,
+        'dt': _ENV_DT, 'fHighCut': 0.5,
+        'h': h, 'z': np.linspace(-MAX_DRAFT, 0.0, 120),
+        't': t,
     }).calculate_jonswap_spectrum()
-    waves = generateRandomPhases(waves, seed=2)
+    waves = generateRandomPhases(waves, seed=seed)
     waves = waves.calculate_free_surface_elevation_time_series_fft()
     waves = waves.calculate_kinematics_fft()
+    eta = getattr(waves, 'eta', np.zeros_like(waves.t))
+    np.savez_compressed(cache_file, t=waves.t, u=waves.u, ut=waves.ut, z=waves.z, eta=eta)
+    print(f"[ENV] Waves computed and saved to {os.path.basename(cache_file)}")
+    return waves
+
+
+def _load_or_compute_wind():
+    """Load or generate the 1200 s Kaimal wind environment (cached to disk)."""
+    V_10 = SPAR0.get('wind_speed', 8.0)
+    I    = TIME_INFO.get('turbulence_intensity', 0.05)
+    l    = TIME_INFO.get('turbulence_length_scale', 340.2)
+    seed = 1
+    t    = np.arange(0.0, _ENV_DURATION, _ENV_DT)
+    cache_file = _env_cache_path('wind', seed, V10=V_10, I=I, l=l)
+
+    if os.path.exists(cache_file):
+        d = np.load(cache_file)
+        return SimpleNamespace(t=d['t'], V_10=float(d['V_10']), V_hub=d['V_hub'])
 
     wind = Wind.from_mapping({
-        'V_10': SPAR0.get('wind_speed', 8.0),
-        'I': TIME_INFO.get('turbulence_intensity', 0.05),
-        'l': TIME_INFO.get('turbulence_length_scale', 340.2),
-        'TDur': time_final,
-        'dt': integration_dt,
-        'fHighCut': 0.5,
-        't': t_integration,
+        'V_10': V_10, 'I': I, 'l': l,
+        'TDur': _ENV_DURATION, 'dt': _ENV_DT,
+        'fHighCut': 0.5, 't': t,
     }).calculate_kaimal_spectrum()
-    wind = generateRandomPhases(wind, seed=1)
+    wind = generateRandomPhases(wind, seed=seed)
     wind = wind.calculate_time_series_fft()
+    np.savez_compressed(cache_file, t=wind.t, V_10=np.array(wind.V_10), V_hub=wind.V_hub)
+    print(f"[ENV] Wind computed and saved to {os.path.basename(cache_file)}")
+    return wind
+
+
+def plot_environment(waves, wind):
+    """Twin-axis time-series plot of wave elevation and hub wind speed over 1200 s."""
+    out_dir = os.path.join(BASE, 'assignment5', 'python', 'outputFig')
+    os.makedirs(out_dir, exist_ok=True)
+
+    fig, ax1 = plt.subplots(figsize=(14, 4))
+    ax2 = ax1.twinx()
+
+    eta = getattr(waves, 'eta', np.zeros_like(waves.t))
+    ax1.plot(waves.t, eta,         color='steelblue',  linewidth=0.8, alpha=0.9, label='Wave elevation [m]')
+    ax2.plot(wind.t,  wind.V_hub,  color='darkorange', linewidth=0.8, alpha=0.9, label='Hub wind speed [m/s]')
+
+    ax1.set_xlabel('Time [s]')
+    ax1.set_ylabel('Wave elevation [m]', color='steelblue')
+    ax2.set_ylabel('Hub wind speed [m/s]', color='darkorange')
+    ax1.tick_params(axis='y', labelcolor='steelblue')
+    ax2.tick_params(axis='y', labelcolor='darkorange')
+    ax1.set_title(
+        f'Environmental conditions — {_ENV_DURATION:.0f} s realisation '
+        f'(JONSWAP Hs={SPAR0.get("significant_wave", 6.0):.1f} m, '
+        f'Kaimal V₁₀={SPAR0.get("wind_speed", 8.0):.1f} m/s)'
+    )
+    ax1.set_xlim(waves.t[0], waves.t[-1])
+    lines  = ax1.get_lines() + ax2.get_lines()
+    labels = [ln.get_label() for ln in lines]
+    ax1.legend(lines, labels, fontsize=9, loc='upper right')
+    ax1.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fpath = os.path.join(out_dir, 'environment_waves_wind_1200s_ro2.png')
+    fig.savefig(fpath, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[ENV] Environment plot saved to {os.path.basename(fpath)}")
+
+
+def execute_optimization_stage(x0, bounds, waves, wind, time_final, time_step, transient_time, maxiter, ftol, stage_name):
+    """Execute one optimisation stage using a pre-computed shared environment."""
+    t_integration = np.arange(0.0, time_final, 2.0 * time_step)
+    print(f"\n[{stage_name}] Starting (T={time_final:.0f}s, {maxiter} iter max, ftol={ftol})...")
 
     feval_progress = tqdm(desc=f'{stage_name} Evals', unit='eval')
     evaluate = _make_cached_evaluator(waves, wind, t_integration, transient_time, feval_progress)
@@ -480,23 +560,30 @@ def run():
     bounds = d_bounds + frac_bounds + draft_bounds + ballast_mass_bounds
 
     # Initial stable anchor point
-    initial_diameters = [20.0, 20.0, 20.0, 20.0, 20.0, 15.0, 15.0, 12.0, 10.0, 8.0]
+    initial_diameters = [20.0, 7.0, 20.0, 18.0, 20.0, 15.0, 15.0, 12.0, 10.0, 8.0]
     initial_fractions = [0.1] * N_NODES 
     initial_draft = 140.0        # Deeper draft increases stability
     initial_ballast_mass = 15e6  # 15,000 tonnes (Higher ballast)
     
     x0 = np.array([*initial_diameters, *initial_fractions, initial_draft, initial_ballast_mass], dtype=float)
 
+    # Pre-compute shared 1200 s environment once — both stages reuse the same realisation
+    print("[ENV] Loading or computing 1200 s environment (JONSWAP seed 2 / Kaimal seed 1)...")
+    waves = _load_or_compute_waves()
+    wind  = _load_or_compute_wind()
+    print("[ENV] Environment ready.")
+    plot_environment(waves, wind)
+
     # =========================================================================
     # STAGE 1: COARSE & SWIFT DESIGN REGIME SWEEP (Saves ~75% Runtime)
     # =========================================================================
     res_stage1, c0_s1, cf_s1 = execute_optimization_stage(
-        x0=x0, bounds=bounds,
-        time_final=400.0,      # Shorter operational simulation
+        x0=x0, bounds=bounds, waves=waves, wind=wind,
+        time_final=400.0,
         time_step=0.5,
-        transient_time=150.0,  # Proportional baseline transient window
-        maxiter=35, 
-        ftol=1e-2,             # Loose engineering tolerance for rough shaping
+        transient_time=150.0,
+        maxiter=35,
+        ftol=1e-2,
         stage_name="STAGE_1_COARSE"
     )
     print_summary(res_stage1, x0, "STAGE 1 RESULTS", c0_s1, cf_s1)
@@ -506,12 +593,12 @@ def run():
     # =========================================================================
     print("\n[STAGE 2] Starting high-fidelity refinement from Stage 1 solution...")
     res_final, c0_s2, cf_s2 = execute_optimization_stage(
-        x0=res_stage1.x, bounds=bounds,  # Hot start from Stage 1 result
-        time_final=1200.0,     # Full validation length
+        x0=res_stage1.x, bounds=bounds, waves=waves, wind=wind,
+        time_final=1200.0,
         time_step=0.5,
         transient_time=600.0,
-        maxiter=15,            # Few steps needed since geometry is already close
-        ftol=1e-3,             # Tight optimization tolerance
+        maxiter=15,
+        ftol=1e-3,
         stage_name="STAGE_2_FINE"
     )
     print_summary(res_final, res_stage1.x, "STAGE 2 RESULTS", c0_s2, cf_s2)
