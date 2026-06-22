@@ -34,7 +34,7 @@ GLOBAL_ROTOR.active = True
 
 # Limits and model setup
 SURGE_RMS_MAX = 30 
-PITCH_RMS_MAX_DEG = 10
+PITCH_RMS_MAX_DEG = 20
 GM_MIN = 0.5  
 FLOATING_MARGIN = 0.0  
 FIXED_THICKNESS = 0.05  
@@ -44,29 +44,26 @@ N_NODES = 10
 UPPER_BOUND_D = 25.0
 MIN_DRAFT = 50.0
 MAX_DRAFT = 150.0
-MIN_BALLAST_HEIGHT = 0.1  
-MAX_BALLAST_HEIGHT = 50.0  
-
-# --- COST MODEL PARAMETERS ---
-COST_STEEL_PER_KG = 2.50     
-COST_CONCRETE_PER_KG = 0.15  
-RHO_CONCRETE = 2400.0  # kg/m³  
+MIN_BALLAST_MASS = 0.0
+MAX_BALLAST_MASS = 2e7     # 20 000 tonnes
+MAX_ADJACENT_TAPER = 2.5  # max diameter change between adjacent nodes [m]
 
 def _split_design(x):
-    x = np.asarray(x, dtype=float)
+    x = np.asarray(x, dtype=float).reshape(-1)
     D_nodes = x[:N_NODES]
-    L_fracs = x[N_NODES:2*N_NODES]
+    L_fracs = x[N_NODES:2 * N_NODES]
     draft = float(x[-2])
-    ballast_height = float(x[-1])
-    return D_nodes, L_fracs, draft, ballast_height
+    ballast_mass = float(x[-1])
+    return D_nodes, L_fracs, draft, ballast_mass
 
 
 def _step_profile(values, n_points):
     values = np.asarray(values, dtype=float).reshape(-1)
     if values.size == 1:
         return np.full(n_points, values.item(), dtype=float)
-    idx = np.linspace(0, values.size - 1, n_points)
-    return values[np.floor(idx).astype(int)]
+    x_nodes = np.linspace(0.0, 1.0, values.size)
+    x_points = np.linspace(0.0, 1.0, n_points)
+    return np.interp(x_points, x_nodes, values)
 
 
 def _design_key(x):
@@ -80,54 +77,36 @@ def _plot_diameter_profile(ax, structure, diameters, label, style='-'):
     ax.step(d_submerged, z_submerged, style, where='post', label=label)
     ax.axhline(0.0, color='k', linewidth=0.8, alpha=0.25)
 
-def _get_weight_distribution(structure, D_nodes, L_fracs, ballast_height, thickness=FIXED_THICKNESS):
-    """Compute discrete total mass (steel shell + concrete ballast) per individual section."""
+def _get_weight_distribution(structure, D_nodes, L_fracs, ballast_mass, thickness=FIXED_THICKNESS):
+    """Cumulative mass from the bottom upward: steel shell + ballast lump at the lowest node."""
     D_nodes = np.asarray(D_nodes, dtype=float).reshape(-1)
     L_fracs = np.maximum(np.asarray(L_fracs, dtype=float), 1e-3)
     L_fracs /= np.sum(L_fracs)
     draft = float(structure.draft)
     section_lengths = L_fracs * draft
-    
+
     rhos = float(structure.rho_Steel or 7850.0)
-    rho_concrete = RHO_CONCRETE
-    
+
     zbot = -draft
     z_edges = np.zeros(N_NODES + 1)
     z_edges[0] = zbot
     for i in range(N_NODES):
-        z_edges[i+1] = z_edges[i] + section_lengths[i]
-    
+        z_edges[i + 1] = z_edges[i] + section_lengths[i]
+
     D_nodes = _step_profile(D_nodes, N_NODES)
     th_nodes = np.full(N_NODES, float(thickness), dtype=float)
-    
+
     outer_area = np.pi * (D_nodes / 2.0) ** 2
     inner_area = np.pi * np.maximum((D_nodes - 2.0 * th_nodes) / 2.0, 0.0) ** 2
     shell_area = outer_area - inner_area
     section_steel_masses = shell_area * rhos * section_lengths
+
+    mass_per_section = section_steel_masses.copy()
+    mass_per_section[0] += max(float(ballast_mass), 0.0)
+
+    return z_edges[:-1], np.cumsum(mass_per_section)
     
-    # Concrete ballast boundaries
-    ballast_height = float(np.clip(ballast_height, 0.1, draft * 0.9))
-    ballast_top = zbot + ballast_height
-    D_bottom = float(D_nodes[0])
-    ballast_area = np.pi * (D_bottom / 2.0) ** 2
-    
-    mass_per_section = np.zeros(N_NODES)
-    
-    # Calculate non-cumulative mass component per discrete section
-    for i in range(N_NODES):
-        z_low = z_edges[i]
-        z_high = z_edges[i+1]
-        
-        # Find how much of the ballast column height overlaps this specific section
-        h_ballast_in_section = max(0.0, min(z_high, ballast_top) - z_low)
-        ballast_mass_in_section = rho_concrete * ballast_area * h_ballast_in_section
-        
-        # Total mass of this block is its outer steel shell + internal concrete fill
-        mass_per_section[i] = section_steel_masses[i] + ballast_mass_in_section
-        
-    return z_edges[:-1], mass_per_section
-    
-def build_structure(draft, D_nodes, L_fracs, ballast_height, spar_template, thickness=FIXED_THICKNESS):
+def build_structure(draft, D_nodes, L_fracs, ballast_mass, spar_template, thickness=FIXED_THICKNESS):
     s = Structure.from_mapping(spar_template)
     s.draft = float(draft)
     
@@ -162,11 +141,7 @@ def build_structure(draft, D_nodes, L_fracs, ballast_height, spar_template, thic
 
     ms = float(np.sum(section_masses))
     
-    # Compute ballast mass from height and bottom section area
-    ballast_height = float(np.clip(ballast_height, 0.1, draft * 0.9))  # Constrain to physical bounds
-    D_bottom = float(D_nodes[0])
-    ballast_area = np.pi * (D_bottom / 2.0) ** 2  # Bottom section outer diameter
-    ballast_mass = RHO_CONCRETE * ballast_area * ballast_height
+    ballast_mass = float(max(ballast_mass, 0.0))
     s.M_Ballast = ballast_mass
     
     mf = ms + ballast_mass
@@ -179,8 +154,8 @@ def build_structure(draft, D_nodes, L_fracs, ballast_height, spar_template, thic
     zCB = float(np.sum(section_volumes * z_mid) / buoyant_volume) if buoyant_volume > 0 else zbot / 2.0
     zCMs = float(np.sum(section_masses * z_mid) / ms) if ms > 0 else fb - ls / 2.0
     
-    # Ballast center of mass: midpoint of ballast height region
-    zballst = zbot + (ballast_height / 2.0)
+    # Ballast treated as a lump mass at the bottom node
+    zballst = zbot
     s.Ballast_COG = zballst
     
     zCMf = (zCMs * ms + zballst * ballast_mass) / mf if mf > 0 else 0.0
@@ -240,8 +215,7 @@ def build_structure(draft, D_nodes, L_fracs, ballast_height, spar_template, thic
 def objective(x):
     D_nodes, L_fracs, draft, ballast_mass = _split_design(x)
     s = build_structure(draft, D_nodes, L_fracs, ballast_mass, SPAR0)
-    total_mass_kg = s.ms + ballast_mass
-    return total_mass_kg
+    return s.ms + s.M_Ballast
 
 
 def constraints_fun(x, waves, wind, t_integration, transient_time, surge_rms_max=SURGE_RMS_MAX, pitch_rms_max_deg=PITCH_RMS_MAX_DEG):
@@ -254,11 +228,17 @@ def constraints_fun(x, waves, wind, t_integration, transient_time, surge_rms_max
     buoyancy_margin = s.buoyant_mass - s.MTot
     gm = (s.IAA / max(s.V_disp, 1e-9)) + s.zCB - s.zCM_Tot
 
-    if buoyancy_margin < 0 or gm < 0.01:
-        buoy_penalty = min(buoyancy_margin, 0.0) / 1e5
-        gm_penalty = min(gm - 0.01, 0.0) * 20.0
-        combined_penalty = -2.0 + buoy_penalty + gm_penalty
-        return np.array([combined_penalty, combined_penalty, (buoyancy_margin - FLOATING_MARGIN) / 1e6, (gm - GM_MIN) / GM_MIN])
+    # If the design is physically impossible, use a large penalty to push it away
+    if buoyancy_margin < 0 or gm < GM_MIN:
+        # Increase these multipliers so the solver prioritizes stability over mass
+        buoy_penalty = min(buoyancy_margin, 0.0) / 1e3
+        gm_penalty = min(gm - GM_MIN, 0.0) * 1e4 
+        
+        return np.array([
+            -10.0, -10.0, # High penalty for instability so it stays away
+            (buoyancy_margin - FLOATING_MARGIN) / 1e6, 
+            (gm - GM_MIN) / GM_MIN
+        ])
 
     # Integrated simulation pass using the pre-compiled global instance
     q0 = np.zeros(5)
@@ -269,16 +249,17 @@ def constraints_fun(x, waves, wind, t_integration, transient_time, surge_rms_max
         post_transient = np.arange(len(t_integration)) >= int(0.5 * len(t_integration))
 
     if np.any(np.isnan(q)) or np.any(np.isinf(q)):
-        return np.array([-2.0, -2.0, (buoyancy_margin - FLOATING_MARGIN) / 1e6, (gm - GM_MIN) / GM_MIN])
+        return np.array([-3.0, -3.0, (buoyancy_margin - FLOATING_MARGIN) / 1e6, (gm - GM_MIN) / GM_MIN])
 
     surge_rms = np.sqrt(np.mean(q[post_transient, 0] ** 2))
     pitch_rms = np.sqrt(np.mean((np.rad2deg(q[post_transient, 1])) ** 2))
 
+    # Clamp to [-3, ...] so unstable-simulation outliers don't wreck gradient estimation
     return np.array([
-        (surge_rms_max - surge_rms) / surge_rms_max,           
-        (pitch_rms_max_deg - pitch_rms) / pitch_rms_max_deg,   
-        (buoyancy_margin - FLOATING_MARGIN) / 1e6,             
-        (gm - GM_MIN) / GM_MIN                                 
+        max(-3.0, (surge_rms_max - surge_rms) / surge_rms_max),
+        max(-3.0, (pitch_rms_max_deg - pitch_rms) / pitch_rms_max_deg),
+        (buoyancy_margin - FLOATING_MARGIN) / 1e6,
+        (gm - GM_MIN) / GM_MIN
     ])
 
 
@@ -302,7 +283,7 @@ def execute_optimization_stage(x0, bounds, time_final, time_step, transient_time
     t_integration = np.arange(0.0, time_final, 2.0 * time_step)
     integration_dt = 2.0 * time_step
     
-    print(f"\n⚡ Pre-computing environment for {stage_name} (Simulation Length: {time_final}s)...")
+    print(f"\n[{stage_name}] Pre-computing environmental conditions (T={time_final:.0f}s, dt={integration_dt:.2f}s)...")
     waves = Waves.from_mapping({
         'Hs': SPAR0.get('significant_wave', 6.0),
         'Tp': SPAR0.get('wave_period', 10.0),
@@ -335,23 +316,29 @@ def execute_optimization_stage(x0, bounds, time_final, time_step, transient_time
     iteration_state = {'k': 0}
     progress = tqdm(total=maxiter, desc=f'{stage_name} Main Loop', unit='iter')
 
-    cons = (
+    cons = [
         {'type': 'ineq', 'fun': lambda x: evaluate(x)['constraints'][0]},
         {'type': 'ineq', 'fun': lambda x: evaluate(x)['constraints'][1]},
         {'type': 'ineq', 'fun': lambda x: evaluate(x)['constraints'][2]},
         {'type': 'ineq', 'fun': lambda x: evaluate(x)['constraints'][3]},
-    )
+    ]
+    for i in range(N_NODES - 1):
+        # Two smooth directional constraints replace the non-differentiable abs():
+        #   D[i+1] - D[i] <=  MAX_ADJACENT_TAPER
+        #   D[i]   - D[i+1] <= MAX_ADJACENT_TAPER
+        cons.append({'type': 'ineq', 'fun': lambda x, idx=i: MAX_ADJACENT_TAPER - (x[idx + 1] - x[idx])})
+        cons.append({'type': 'ineq', 'fun': lambda x, idx=i: MAX_ADJACENT_TAPER + (x[idx + 1] - x[idx])})
 
     def callback(xk):
         iteration_state['k'] += 1
         res_data = evaluate(xk)
         progress.update(1)
-        D_nodes, _, dk, h_ballast = _split_design(xk)
+        D_nodes, _, draft, bm = _split_design(xk)
         D_summary = ", ".join(f"{d:.1f}" for d in np.round(D_nodes, 1))
         tqdm.write(
             f"[{stage_name} Iter {iteration_state['k']:02d}] "
-            f"Draft={dk:.1f}m | BallastHeight={h_ballast:.1f}m | "
-            f"D=[{D_summary}] m | Cost={res_data['objective']:.4f}"
+            f"Draft={draft:.1f}m | Ballast={bm/1e3:.1f}t | "
+            f"D=[{D_summary}] m | Mass={res_data['objective']:.1f} kg"
         )
 
     # Evaluate at the initial point to prime the cache and record c0
@@ -369,11 +356,11 @@ def execute_optimization_stage(x0, bounds, time_final, time_step, transient_time
     return res, c0, c_final
 
 def print_summary(res, x0, title, c0, c_final):
-    D_f, L_f, dr_f, h_f = _split_design(res.x)
-    D_0, L_0, dr_0, h_0 = _split_design(x0)
+    D_f, L_f, dr_f, bm_f = _split_design(res.x)
+    D_0, L_0, dr_0, bm_0 = _split_design(x0)
 
-    s0 = build_structure(dr_0, D_0, L_0, h_0, SPAR0)
-    sf = build_structure(dr_f, D_f, L_f, h_f, SPAR0)
+    s0 = build_structure(dr_0, D_0, L_0, bm_0, SPAR0)
+    sf = build_structure(dr_f, D_f, L_f, bm_f, SPAR0)
 
     sep = '=' * 74
     print(f"\n{sep}")
@@ -384,15 +371,14 @@ def print_summary(res, x0, title, c0, c_final):
     print(f"\n  {'Parameter':<30} {'Initial':>16} {'Final':>16}")
     print(f"  {'-'*64}")
     print(f"  {'Draft [m]':<30} {dr_0:>16.3f} {dr_f:>16.3f}")
-    print(f"  {'Ballast mass [kg]':<30} {s0.M_Ballast:>16.1f} {sf.M_Ballast:>16.1f}")
-    print(f"  {'Ballast height [m]':<30} {h_0:>16.3f} {h_f:>16.3f}")
+    print(f"  {'Ballast mass [kg]':<30} {bm_0:>16.1f} {bm_f:>16.1f}")
     for i in range(N_NODES):
         print(f"  {'D_node_' + str(i+1) + ' [m]':<30} {D_0[i]:>16.4f} {D_f[i]:>16.4f}")
     for i in range(N_NODES):
         print(f"  {'L_frac_' + str(i+1):<30} {L_0[i]:>16.5f} {L_f[i]:>16.5f}")
 
     # --- Constraints: un-normalise back to physical units ---
-    # Convention: c[k] > 0 → satisfied, c[k] = 0 → active, c[k] < 0 → violated
+    # Convention: c[k] > 0 -> satisfied, c[k] = 0 -> active, c[k] < 0 -> violated
     surge_0  = SURGE_RMS_MAX      * (1.0 - c0[0])
     surge_f  = SURGE_RMS_MAX      * (1.0 - c_final[0])
     pitch_0  = PITCH_RMS_MAX_DEG  * (1.0 - c0[1])
@@ -439,7 +425,7 @@ def print_summary(res, x0, title, c0, c_final):
         var_labels = (
             [f"D_node_{i+1}" for i in range(N_NODES)] +
             [f"L_frac_{i+1}" for i in range(N_NODES)] +
-            ["Draft", "BallastH"]
+            ["Draft", "BallastM"]
         )
         print(f"  (Objective gradient df/dx at solution — active-constraint rows are the KKT proxy)")
         for lbl, g in zip(var_labels, jac):
@@ -461,23 +447,28 @@ def save_results_plot(res, x0, stage_name):
     # Diameter Profile
     _plot_diameter_profile(axes[0], s0, D0, 'Initial', style='--')
     _plot_diameter_profile(axes[0], s, D, 'Final', style='-')
-    axes[0].set_title(f'Diameter Profile: {stage_name}')
+    axes[0].set_xlabel('Diameter [m]')
+    axes[0].set_ylabel('Elevation z [m]')
+    axes[0].set_title(f'Diameter profile: {stage_name}')
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 
-    # Weight Distribution
+    # Cumulative mass distribution
     z, m = _get_weight_distribution(s, D, L, b)
     z0, m0 = _get_weight_distribution(s0, D0, L0, b0)
-    axes[1].step(m0 / 1e6, z0, '--', where='post', label='Initial')
-    axes[1].step(m / 1e6, z, '-', where='post', label='Final')
-    axes[1].set_title(f'Weight Distribution: {stage_name}')
+    axes[1].step(m0 / 1e3, z0, '--', where='post', label='Initial')
+    axes[1].step(m  / 1e3, z,  '-',  where='post', label='Final')
+    axes[1].set_xlabel('Cumulative mass [tonnes]')
+    axes[1].set_ylabel('Elevation z [m]')
+    axes[1].set_title(f'Cumulative mass: {stage_name}')
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
 
     out_dir = os.path.join(BASE, 'assignment5', 'python', 'outputFig')
     os.makedirs(out_dir, exist_ok=True)
-    fig.savefig(os.path.join(out_dir, f'spar_optimization_{stage_name.lower()}_ro2.png'), dpi=200)
-    plt.close(fig) # Prevent memory buildup
+    fname = f'spar_diameter_and_mass_{stage_name.lower()}_ro2.png'
+    fig.savefig(os.path.join(out_dir, fname), dpi=200, bbox_inches='tight')
+    plt.close(fig)
 
 
 def run():
@@ -485,15 +476,16 @@ def run():
     d_bounds = [(4.0, UPPER_BOUND_D)] * N_NODES 
     frac_bounds = [(0.03, 0.35)] * N_NODES  
     draft_bounds = [(MIN_DRAFT, MAX_DRAFT)]
-    ballast_height_bounds = [(MIN_BALLAST_HEIGHT, MAX_BALLAST_HEIGHT)]
-    bounds = d_bounds + frac_bounds + draft_bounds + ballast_height_bounds
+    ballast_mass_bounds = [(MIN_BALLAST_MASS, MAX_BALLAST_MASS)]
+    bounds = d_bounds + frac_bounds + draft_bounds + ballast_mass_bounds
 
-    # Initial Stable Anchor Vector Point
-    initial_diameters = [14.0] * N_NODES  
-    initial_fractions = [1.0 / N_NODES] * N_NODES  
-    initial_draft = 120.0  
-    initial_ballast_height = 15.0  # Initial height of concrete ballast in meters
-    x0 = np.array([*initial_diameters, *initial_fractions, initial_draft, initial_ballast_height], dtype=float)
+    # Initial stable anchor point
+    initial_diameters = [20.0, 20.0, 20.0, 20.0, 20.0, 15.0, 15.0, 12.0, 10.0, 8.0]
+    initial_fractions = [0.1] * N_NODES 
+    initial_draft = 140.0        # Deeper draft increases stability
+    initial_ballast_mass = 15e6  # 15,000 tonnes (Higher ballast)
+    
+    x0 = np.array([*initial_diameters, *initial_fractions, initial_draft, initial_ballast_mass], dtype=float)
 
     # =========================================================================
     # STAGE 1: COARSE & SWIFT DESIGN REGIME SWEEP (Saves ~75% Runtime)
@@ -512,7 +504,7 @@ def run():
     # =========================================================================
     # STAGE 2: HIGH-FIDELITY STRUCTURAL POLISH
     # =========================================================================
-    print("\n💎 Transitioning to final high-fidelity confirmation stage...")
+    print("\n[STAGE 2] Starting high-fidelity refinement from Stage 1 solution...")
     res_final, c0_s2, cf_s2 = execute_optimization_stage(
         x0=res_stage1.x, bounds=bounds,  # Hot start from Stage 1 result
         time_final=1200.0,     # Full validation length
@@ -524,62 +516,61 @@ def run():
     )
     print_summary(res_final, res_stage1.x, "STAGE 2 RESULTS", c0_s2, cf_s2)
 
-    print('\n' + '='*50 + '\n✔ OPTIMIZATION COMPLETE\n' + '='*50)
-    print(res_final.message)
-    
-    # Structural Profile Extraction and Comparison Plots
+    sep = '=' * 74
+    print(f"\n{sep}")
+    print(f"  OPTIMIZATION COMPLETE")
+    print(f"  {res_final.message}")
+    print(sep)
+
+    out_dir = os.path.join(BASE, 'assignment5', 'python', 'outputFig')
+    os.makedirs(out_dir, exist_ok=True)
+
+    # --- Per-stage plots ---
+    save_results_plot(res_stage1, x0,        "stage1_coarse")
+    save_results_plot(res_final,  res_stage1.x, "stage2_fine")
+
+    # --- Three-way comparison plot (Initial / Stage-1 / Stage-2) ---
     D_stage1, L_stage1, dr_stage1, b_stage1 = _split_design(res_stage1.x)
     D0, L0, dr0, b0 = _split_design(x0)
     Df, Lf, drf, bf = _split_design(res_final.x)
-    
-    # Debug: print actual diameter values
-    print("\n--- DIAMETER NODE VALUES ---")
-    print(f"Initial: {D0}")
-    print(f"Fast Optimum: {D_stage1}")
-    print(f"Full Optimum: {Df}")
-    
-    s0 = build_structure(dr0, D0, L0, b0, SPAR0)
-    s1 = build_structure(dr_stage1, D_stage1, L_stage1, b_stage1, SPAR0)
-    sf = build_structure(drf, Df, Lf, bf, SPAR0)
 
-    # Create 2-subplot figure: diameter profile and weight distribution
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    
-    # Subplot 1: Diameter Profile
+    s0 = build_structure(dr0,       D0,       L0,       b0,       SPAR0)
+    s1 = build_structure(dr_stage1, D_stage1, L_stage1, b_stage1, SPAR0)
+    sf = build_structure(drf,       Df,       Lf,       bf,       SPAR0)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
     ax_d = axes[0]
-    _plot_diameter_profile(ax_d, s0, D0, f'Initial Guess ({dr0:.1f}m)', style='--')
-    _plot_diameter_profile(ax_d, s1, D_stage1, f'Fast Optimum ({dr_stage1:.1f}m)', style='-.')
-    _plot_diameter_profile(ax_d, sf, Df, f'Full Optimum ({drf:.1f}m)', style='-')
+    _plot_diameter_profile(ax_d, s0, D0,       f'Initial guess  (draft={dr0:.0f} m)',       style='--')
+    _plot_diameter_profile(ax_d, s1, D_stage1, f'Stage 1 coarse (draft={dr_stage1:.0f} m)', style='-.')
+    _plot_diameter_profile(ax_d, sf, Df,       f'Stage 2 fine   (draft={drf:.0f} m)',       style='-')
     ax_d.set_xlabel('Diameter [m]')
     ax_d.set_ylabel('Elevation z [m]')
-    ax_d.set_title('Diameter Profile Comparison')
+    ax_d.set_title('Diameter profile — all stages')
     ax_d.set_ylim(float(s0.z_edges_computed[0]), 0.0)
     ax_d.grid(True, alpha=0.3)
-    ax_d.legend(fontsize=10)
-    
-    # Subplot 2: Weight Distribution
+    ax_d.legend(fontsize=9)
+
     ax_w = axes[1]
-    z0, m0 = _get_weight_distribution(s0, D0, L0, b0)
+    z0, m0 = _get_weight_distribution(s0, D0,       L0,       b0)
     z1, m1 = _get_weight_distribution(s1, D_stage1, L_stage1, b_stage1)
-    zf, mf = _get_weight_distribution(sf, Df, Lf, bf)
-    
-    ax_w.step(m0 / 1e6, z0, '--', where='post', label='Initial', linewidth=2)
-    ax_w.step(m1 / 1e6, z1, '-.', where='post', label='Fast Optimum', linewidth=2)
-    ax_w.step(mf / 1e6, zf, '-', where='post', label='Full Optimum', linewidth=2)
+    zf, mf_w = _get_weight_distribution(sf, Df,     Lf,       bf)
+    ax_w.step(m0   / 1e3, z0, '--', where='post', label='Initial guess',  linewidth=2)
+    ax_w.step(m1   / 1e3, z1, '-.',  where='post', label='Stage 1 coarse', linewidth=2)
+    ax_w.step(mf_w / 1e3, zf, '-',   where='post', label='Stage 2 fine',   linewidth=2)
     ax_w.axhline(0.0, color='k', linewidth=0.8, alpha=0.25)
-    ax_w.set_xlabel('Cumulative Mass [Million kg]')
+    ax_w.set_xlabel('Cumulative mass [tonnes]')
     ax_w.set_ylabel('Elevation z [m]')
-    ax_w.set_title('Weight Distribution (Steel + Ballast)')
+    ax_w.set_title('Cumulative mass distribution — steel + ballast')
     ax_w.set_ylim(float(s0.z_edges_computed[0]), 0.0)
     ax_w.grid(True, alpha=0.3)
-    ax_w.legend(fontsize=10)
-    
+    ax_w.legend(fontsize=9)
+
+    fig.suptitle('Spar buoy optimisation — multi-stage comparison', fontsize=12)
     fig.tight_layout()
-    
-    out_dir = os.path.join(BASE, 'assignment5', 'python', 'outputFig')
-    os.makedirs(out_dir, exist_ok=True)
-    fig.savefig(os.path.join(out_dir, 'spar_geometry_optimization_ro2.png'), dpi=200)
-    plt.show(block=False)
+    fig.savefig(os.path.join(out_dir, 'spar_multistage_diameter_and_mass_ro2.png'), dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Figures saved to: {out_dir}")
 
     return res_final
 
