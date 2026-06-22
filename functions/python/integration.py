@@ -1,8 +1,9 @@
 import numpy as np
+np.trapz = np.trapezoid
 from bisect import bisect_left as lookup
 
 from floatingRotor import F_wind as F_wind_floating
-from loads import forceDistributed
+from monopile import forceDistributed
 
 
 class Integrator:

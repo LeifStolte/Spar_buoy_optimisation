@@ -16,7 +16,7 @@ from tqdm.auto import tqdm
 # Import the existing runner to reuse build_structure and helpers
 import runpy
 import types
-R2_path = os.path.join(os.path.dirname(__file__), 'RUN_OPTIMIZER2.PY')
+R2_path = os.path.join(os.path.dirname(__file__), 'run_optimizer.py')
 R2_globals = runpy.run_path(R2_path)
 R2 = types.SimpleNamespace(**R2_globals)
 
@@ -27,7 +27,6 @@ COST_CONCRETE_PER_KG = R2.COST_CONCRETE_PER_KG
 RHO_CONCRETE = R2.RHO_CONCRETE
 
 EPS_FD = 1e-6
-
 
 def _split_design(x):
     return R2._split_design(x)

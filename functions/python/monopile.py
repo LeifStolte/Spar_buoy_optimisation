@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 import numpy as np
+np.trapz = np.trapezoid
 
 from common import loadConstants
 from models import Model

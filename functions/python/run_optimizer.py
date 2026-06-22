@@ -1,5 +1,6 @@
 import os
 import numpy as np
+np.trapz = np.trapezoid
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 from tqdm.auto import tqdm
@@ -385,7 +386,7 @@ def run(maxiter=50, surge_rms_max=SURGE_RMS_MAX, pitch_rms_max_deg=PITCH_RMS_MAX
     # Save to the repository's Spar_buoy_optimisation assignment5 outputFig (explicit BASE path)
     out_dir = os.path.join(BASE, 'assignment5', 'python', 'outputFig')
     os.makedirs(out_dir, exist_ok=True)
-    fig_path = os.path.join(out_dir, 'spar_geometry_optimization.png')
+    fig_path = os.path.join(out_dir, 'spar_geometry_optimization_ro1.png')
     fig.savefig(fig_path, dpi=200, bbox_inches='tight')
     print(f'Saved geometry figure: {fig_path}')
     plt.show(block=False)

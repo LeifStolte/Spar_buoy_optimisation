@@ -237,11 +237,11 @@ def build_structure(draft, D_nodes, L_fracs, ballast_height, spar_template, thic
 
     return s
 
-
 def objective(x):
     D_nodes, L_fracs, draft, ballast_mass = _split_design(x)
     s = build_structure(draft, D_nodes, L_fracs, ballast_mass, SPAR0)
-    return (s.ms * COST_STEEL_PER_KG + ballast_mass * COST_CONCRETE_PER_KG) / 1e6
+    total_mass_kg = s.ms + ballast_mass
+    return total_mass_kg
 
 
 def constraints_fun(x, waves, wind, t_integration, transient_time, surge_rms_max=SURGE_RMS_MAX, pitch_rms_max_deg=PITCH_RMS_MAX_DEG):
@@ -354,14 +354,130 @@ def execute_optimization_stage(x0, bounds, time_final, time_step, transient_time
             f"D=[{D_summary}] m | Cost={res_data['objective']:.4f}"
         )
 
+    # Evaluate at the initial point to prime the cache and record c0
+    c0 = evaluate(x0)['constraints']
+
     res = minimize(
         objective, x0, method='SLSQP', bounds=bounds, constraints=cons, callback=callback,
         options={'maxiter': maxiter, 'ftol': ftol, 'eps': 1e-4, 'disp': False}
     )
-    
+
+    c_final = evaluate(res.x)['constraints']
+
     progress.close()
     feval_progress.close()
-    return res
+    return res, c0, c_final
+
+def print_summary(res, x0, title, c0, c_final):
+    D_f, L_f, dr_f, h_f = _split_design(res.x)
+    D_0, L_0, dr_0, h_0 = _split_design(x0)
+
+    s0 = build_structure(dr_0, D_0, L_0, h_0, SPAR0)
+    sf = build_structure(dr_f, D_f, L_f, h_f, SPAR0)
+
+    sep = '=' * 74
+    print(f"\n{sep}")
+    print(f"  {title}")
+    print(sep)
+
+    # --- Design Variables ---
+    print(f"\n  {'Parameter':<30} {'Initial':>16} {'Final':>16}")
+    print(f"  {'-'*64}")
+    print(f"  {'Draft [m]':<30} {dr_0:>16.3f} {dr_f:>16.3f}")
+    print(f"  {'Ballast mass [kg]':<30} {s0.M_Ballast:>16.1f} {sf.M_Ballast:>16.1f}")
+    print(f"  {'Ballast height [m]':<30} {h_0:>16.3f} {h_f:>16.3f}")
+    for i in range(N_NODES):
+        print(f"  {'D_node_' + str(i+1) + ' [m]':<30} {D_0[i]:>16.4f} {D_f[i]:>16.4f}")
+    for i in range(N_NODES):
+        print(f"  {'L_frac_' + str(i+1):<30} {L_0[i]:>16.5f} {L_f[i]:>16.5f}")
+
+    # --- Constraints: un-normalise back to physical units ---
+    # Convention: c[k] > 0 → satisfied, c[k] = 0 → active, c[k] < 0 → violated
+    surge_0  = SURGE_RMS_MAX      * (1.0 - c0[0])
+    surge_f  = SURGE_RMS_MAX      * (1.0 - c_final[0])
+    pitch_0  = PITCH_RMS_MAX_DEG  * (1.0 - c0[1])
+    pitch_f  = PITCH_RMS_MAX_DEG  * (1.0 - c_final[1])
+    buoy_0   = c0[2]      * 1e6 + FLOATING_MARGIN
+    buoy_f   = c_final[2] * 1e6 + FLOATING_MARGIN
+    gm_0     = c0[3]      * GM_MIN + GM_MIN
+    gm_f     = c_final[3] * GM_MIN + GM_MIN
+
+    CON_NAMES  = ["Surge RMS", "Pitch RMS", "Buoyancy", "GM (stability)"]
+    CON_UNITS  = ["m", "deg", "kg", "m"]
+    CON_LIMITS = [
+        f"<= {SURGE_RMS_MAX:.1f} m",
+        f"<= {PITCH_RMS_MAX_DEG:.1f} deg",
+        "> 0 kg",
+        f"> {GM_MIN:.2f} m",
+    ]
+    phys_init  = [surge_0, pitch_0, buoy_0, gm_0]
+    phys_final = [surge_f, pitch_f, buoy_f, gm_f]
+    ACTIVE_TOL = 0.05
+
+    print(f"\n  {'Constraint':<18} {'Limit':<22} {'Initial':>12} {'Final':>12} {'Status':>10}")
+    print(f"  {'-'*78}")
+    for name, limit, unit, pv0, pvf, cvf in zip(
+            CON_NAMES, CON_LIMITS, CON_UNITS, phys_init, phys_final, c_final):
+        if cvf < -ACTIVE_TOL:
+            status = "VIOLATED"
+        elif abs(cvf) <= ACTIVE_TOL:
+            status = "ACTIVE"
+        else:
+            status = "Inactive"
+        print(f"  {name:<18} {limit:<22} {pv0:>12.3f} {pvf:>12.3f} {status:>10}")
+
+    # --- Lagrange Multipliers / KKT information ---
+    print(f"\n  Lagrange Multipliers / KKT information:")
+    print(f"  {'-'*52}")
+    if hasattr(res, 'v') and res.v is not None:
+        lm_vals = np.asarray(res.v).reshape(-1)
+        lm_labels = CON_NAMES[:len(lm_vals)]
+        for lbl, mu in zip(lm_labels, lm_vals):
+            print(f"    {lbl:<28}: {mu:>14.6e}")
+    elif hasattr(res, 'jac') and res.jac is not None:
+        jac = np.asarray(res.jac).reshape(-1)
+        var_labels = (
+            [f"D_node_{i+1}" for i in range(N_NODES)] +
+            [f"L_frac_{i+1}" for i in range(N_NODES)] +
+            ["Draft", "BallastH"]
+        )
+        print(f"  (Objective gradient df/dx at solution — active-constraint rows are the KKT proxy)")
+        for lbl, g in zip(var_labels, jac):
+            print(f"    {lbl:<28}: {g:>14.6e}")
+    else:
+        print("    Not available from solver.")
+
+    print(sep)
+
+def save_results_plot(res, x0, stage_name):
+    """Saves diameter and mass plots for a given optimization result."""
+    D, L, dr, b = _split_design(res.x)
+    D0, L0, dr0, b0 = _split_design(x0)
+    s = build_structure(dr, D, L, b, SPAR0)
+    s0 = build_structure(dr0, D0, L0, b0, SPAR0)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Diameter Profile
+    _plot_diameter_profile(axes[0], s0, D0, 'Initial', style='--')
+    _plot_diameter_profile(axes[0], s, D, 'Final', style='-')
+    axes[0].set_title(f'Diameter Profile: {stage_name}')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    # Weight Distribution
+    z, m = _get_weight_distribution(s, D, L, b)
+    z0, m0 = _get_weight_distribution(s0, D0, L0, b0)
+    axes[1].step(m0 / 1e6, z0, '--', where='post', label='Initial')
+    axes[1].step(m / 1e6, z, '-', where='post', label='Final')
+    axes[1].set_title(f'Weight Distribution: {stage_name}')
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    out_dir = os.path.join(BASE, 'assignment5', 'python', 'outputFig')
+    os.makedirs(out_dir, exist_ok=True)
+    fig.savefig(os.path.join(out_dir, f'spar_optimization_{stage_name.lower()}_ro2.png'), dpi=200)
+    plt.close(fig) # Prevent memory buildup
 
 
 def run():
@@ -382,7 +498,7 @@ def run():
     # =========================================================================
     # STAGE 1: COARSE & SWIFT DESIGN REGIME SWEEP (Saves ~75% Runtime)
     # =========================================================================
-    res_stage1 = execute_optimization_stage(
+    res_stage1, c0_s1, cf_s1 = execute_optimization_stage(
         x0=x0, bounds=bounds,
         time_final=400.0,      # Shorter operational simulation
         time_step=0.5,
@@ -391,12 +507,13 @@ def run():
         ftol=1e-2,             # Loose engineering tolerance for rough shaping
         stage_name="STAGE_1_COARSE"
     )
+    print_summary(res_stage1, x0, "STAGE 1 RESULTS", c0_s1, cf_s1)
 
     # =========================================================================
     # STAGE 2: HIGH-FIDELITY STRUCTURAL POLISH
     # =========================================================================
     print("\n💎 Transitioning to final high-fidelity confirmation stage...")
-    res_final = execute_optimization_stage(
+    res_final, c0_s2, cf_s2 = execute_optimization_stage(
         x0=res_stage1.x, bounds=bounds,  # Hot start from Stage 1 result
         time_final=1200.0,     # Full validation length
         time_step=0.5,
@@ -405,6 +522,7 @@ def run():
         ftol=1e-3,             # Tight optimization tolerance
         stage_name="STAGE_2_FINE"
     )
+    print_summary(res_final, res_stage1.x, "STAGE 2 RESULTS", c0_s2, cf_s2)
 
     print('\n' + '='*50 + '\n✔ OPTIMIZATION COMPLETE\n' + '='*50)
     print(res_final.message)
@@ -460,7 +578,7 @@ def run():
     
     out_dir = os.path.join(BASE, 'assignment5', 'python', 'outputFig')
     os.makedirs(out_dir, exist_ok=True)
-    fig.savefig(os.path.join(out_dir, 'spar_accelerated_optimum.png'), dpi=200)
+    fig.savefig(os.path.join(out_dir, 'spar_geometry_optimization_ro2.png'), dpi=200)
     plt.show(block=False)
 
     return res_final

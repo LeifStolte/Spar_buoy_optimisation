@@ -1,5 +1,6 @@
 import numpy as np
-from loads import forceDistributed
+np.trapz = np.trapezoid
+from monopile import forceDistributed
 from bisect import bisect_left as lookup
 from floatingRotor import F_wind as F_wind_floating
 
