@@ -426,7 +426,7 @@ def execute_optimization_stage(x0, bounds, waves, wind, time_final, time_step, t
 
     res = minimize(
         objective, x0, method='SLSQP', bounds=bounds, constraints=cons, callback=callback,
-        options={'maxiter': maxiter, 'ftol': ftol, 'eps': 1e-4, 'disp': False}
+        options={'maxiter': maxiter, 'ftol': ftol, 'eps': 1e-5, 'disp': False}
     )
 
     c_final = evaluate(res.x)['constraints']
