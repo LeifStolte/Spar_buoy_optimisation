@@ -35,9 +35,10 @@ GLOBAL_ROTOR.active = True
 
 # Limits and model setup
 SURGE_RMS_MAX = 30 
-PITCH_RMS_MAX_DEG = 20
+PITCH_RMS_MAX_DEG = 10
 GM_MIN = 0.5  
 FLOATING_MARGIN = 0.0  
+BUOYANCY_SCALE = 1e7
 FIXED_THICKNESS = 0.05  
 N_NODES = 10
 
@@ -69,6 +70,118 @@ def _step_profile(values, n_points):
 
 def _design_key(x):
     return np.asarray(x, dtype=float).reshape(-1).tobytes()
+
+
+def _bounds_arrays(bounds):
+    lb = np.array([b[0] for b in bounds], dtype=float)
+    ub = np.array([b[1] for b in bounds], dtype=float)
+    scale = ub - lb
+    if np.any(scale <= 0.0):
+        raise ValueError("All optimization bounds must have positive width.")
+    return lb, ub, scale
+
+
+def _localized_bounds(bounds, x_center, move_limits=None):
+    if move_limits is None:
+        return bounds
+
+    x_center = np.asarray(x_center, dtype=float)
+    move_limits = np.asarray(move_limits, dtype=float)
+    localized = []
+    for (lo, hi), xc, mv in zip(bounds, x_center, move_limits):
+        localized.append((max(lo, xc - mv), min(hi, xc + mv)))
+    return localized
+
+
+def _to_scaled(x, lb, scale):
+    return (np.asarray(x, dtype=float) - lb) / scale
+
+
+def _from_scaled(y, lb, scale):
+    return lb + np.asarray(y, dtype=float) * scale
+
+
+def _taper_margins(D_nodes):
+    D_nodes = np.asarray(D_nodes, dtype=float).reshape(-1)
+    return MAX_ADJACENT_TAPER - np.abs(np.diff(D_nodes))
+
+
+def _dynamic_response_is_penalty(c_vec):
+    c_vec = np.asarray(c_vec, dtype=float).reshape(-1)
+    return (
+        np.isclose(c_vec[0], -10.0) or np.isclose(c_vec[1], -10.0) or
+        np.isclose(c_vec[0], -3.0) or np.isclose(c_vec[1], -3.0)
+    )
+
+
+def _dynamic_response_text(c_val, limit):
+    if np.isclose(c_val, -10.0) or np.isclose(c_val, -3.0):
+        return "not simulated"
+    return f"{limit * (1.0 - c_val):.3f}"
+
+
+def _static_margins(x):
+    D_nodes, L_fracs, draft, ballast_mass = _split_design(x)
+    s = build_structure(draft, D_nodes, L_fracs, ballast_mass, SPAR0)
+    buoyancy_margin = s.buoyant_mass - s.MTot
+    gm = (s.IAA / max(s.V_disp, 1e-9)) + s.zCB - s.zCM_Tot
+    min_taper_margin = float(np.min(_taper_margins(D_nodes)))
+    return buoyancy_margin, gm, min_taper_margin
+
+
+def _select_initial_design(waves, wind):
+    """Pick a starting design that is statically and dynamically feasible in stage 1."""
+    t_int = np.arange(0.0, 400.0, 1.0)
+    t_trans = 150.0
+
+    candidates = [
+        {
+            'name': 'balanced_light',
+            'D': [20.0, 18.0, 16.0, 15.0, 14.0, 13.0, 12.0, 11.0, 10.0, 9.0],
+            'draft': 140.0,
+            'ballast': 15e6,
+        },
+        {
+            'name': 'balanced_heavier',
+            'D': [22.0, 20.0, 18.0, 16.0, 14.0, 13.0, 12.0, 11.0, 10.0, 9.0],
+            'draft': 145.0,
+            'ballast': 20e6,
+        },
+        {
+            'name': 'upper_mid',
+            'D': [22.0, 21.0, 19.0, 17.0, 15.0, 13.0, 12.0, 11.0, 10.0, 9.0],
+            'draft': 145.0,
+            'ballast': 20e6,
+        },
+        {
+            'name': 'stiff_feasible',
+            'D': [24.0, 22.0, 20.0, 18.0, 16.0, 14.0, 12.0, 11.0, 10.0, 9.0],
+            'draft': 150.0,
+            'ballast': 20e6,
+        },
+    ]
+
+    best = None
+    best_score = -np.inf
+    print("[INIT] Evaluating a few candidate starting designs...")
+    for cand in candidates:
+        x = np.array([*cand['D'], *([0.1] * N_NODES), cand['draft'], cand['ballast']], dtype=float)
+        c = constraints_fun(x, waves, wind, t_int, t_trans)
+        taper = _taper_margins(x[:N_NODES])
+        score = float(min(np.min(c), np.min(taper)))
+        buoy0, gm0, taper0 = _static_margins(x)
+        print(
+            f"[INIT] {cand['name']:<16} "
+            f"min(c)={np.min(c):>8.3f}  "
+            f"buoy={buoy0:>10.3e}  GM={gm0:>7.3f}  "
+            f"taper={taper0:>6.3f}"
+        )
+        if score > best_score:
+            best = x
+            best_score = score
+
+    print(f"[INIT] Selected starting design score = {best_score:.3f}")
+    return best
 
 
 def _plot_diameter_profile(ax, structure, diameters, label, style='-'):
@@ -228,15 +341,13 @@ def constraints_fun(x, waves, wind, t_integration, transient_time, surge_rms_max
     buoyancy_margin = s.buoyant_mass - s.MTot
     gm = (s.IAA / max(s.V_disp, 1e-9)) + s.zCB - s.zCM_Tot
 
-    # If the design is physically impossible, use a large penalty to push it away
+    # If the design is physically impossible, skip the expensive dynamic solve.
+    # The surge/pitch entries below are penalty markers, not physical responses.
     if buoyancy_margin < 0 or gm < GM_MIN:
-        # Increase these multipliers so the solver prioritizes stability over mass
-        buoy_penalty = min(buoyancy_margin, 0.0) / 1e3
-        gm_penalty = min(gm - GM_MIN, 0.0) * 1e4 
-        
         return np.array([
-            -10.0, -10.0, # High penalty for instability so it stays away
-            (buoyancy_margin - FLOATING_MARGIN) / 1e6, 
+            -10.0,
+            -10.0,
+            (buoyancy_margin - FLOATING_MARGIN) / BUOYANCY_SCALE,
             (gm - GM_MIN) / GM_MIN
         ])
 
@@ -249,7 +360,12 @@ def constraints_fun(x, waves, wind, t_integration, transient_time, surge_rms_max
         post_transient = np.arange(len(t_integration)) >= int(0.5 * len(t_integration))
 
     if np.any(np.isnan(q)) or np.any(np.isinf(q)):
-        return np.array([-3.0, -3.0, (buoyancy_margin - FLOATING_MARGIN) / 1e6, (gm - GM_MIN) / GM_MIN])
+        return np.array([
+            -3.0,
+            -3.0,
+            (buoyancy_margin - FLOATING_MARGIN) / BUOYANCY_SCALE,
+            (gm - GM_MIN) / GM_MIN
+        ])
 
     surge_rms = np.sqrt(np.mean(q[post_transient, 0] ** 2))
     pitch_rms = np.sqrt(np.mean((np.rad2deg(q[post_transient, 1])) ** 2))
@@ -257,7 +373,7 @@ def constraints_fun(x, waves, wind, t_integration, transient_time, surge_rms_max
     return np.array([
         (surge_rms_max - surge_rms) / surge_rms_max,
         (pitch_rms_max_deg - pitch_rms) / pitch_rms_max_deg,
-        buoyancy_margin / 1e7,  # Assuming ~10,000 tonnes
+        (buoyancy_margin - FLOATING_MARGIN) / BUOYANCY_SCALE,
         (gm - GM_MIN) / GM_MIN
     ])
 
@@ -385,54 +501,134 @@ def plot_environment(waves, wind):
     print(f"[ENV] Environment plot saved to {os.path.basename(fpath)}")
 
 
-def execute_optimization_stage(x0, bounds, waves, wind, time_final, time_step, transient_time, maxiter, ftol, stage_name):
+def execute_optimization_stage(x0, bounds, waves, wind, time_final, time_step, transient_time, maxiter, ftol, stage_name, move_limits=None):
     """Execute one optimisation stage using a pre-computed shared environment."""
     t_integration = np.arange(0.0, time_final, 2.0 * time_step)
     print(f"\n[{stage_name}] Starting (T={time_final:.0f}s, {maxiter} iter max, ftol={ftol})...")
 
+    stage_bounds = _localized_bounds(bounds, x0, move_limits)
+    lb, ub, x_scale = _bounds_arrays(stage_bounds)
+    y0 = np.clip(_to_scaled(x0, lb, x_scale), 0.0, 1.0)
+    y_bounds = [(0.0, 1.0)] * len(y0)
+    objective_scale = 1e6
+    if move_limits is not None:
+        print(f"[{stage_name}] Using local move limits for scaled SLSQP variables.")
+
     feval_progress = tqdm(desc=f'{stage_name} Evals', unit='eval')
     evaluate = _make_cached_evaluator(waves, wind, t_integration, transient_time, feval_progress)
 
-    iteration_state = {'k': 0}
-    progress = tqdm(total=maxiter, desc=f'{stage_name} Main Loop', unit='iter')
+    def y_to_x(y):
+        return _from_scaled(y, lb, x_scale)
+
+    def objective_y(y):
+        return objective(y_to_x(y)) / objective_scale
+
+    def constraints_y(y):
+        return evaluate(y_to_x(y))['constraints']
+
+    def first_order_optimality(y):
+        y = np.asarray(y, dtype=float)
+        grad = np.zeros_like(y)
+        h = 1e-6
+        for j in range(len(y)):
+            yp = y.copy()
+            ym = y.copy()
+            yp[j] = min(1.0, yp[j] + h)
+            ym[j] = max(0.0, ym[j] - h)
+            denom = yp[j] - ym[j]
+            if denom > 0.0:
+                grad[j] = (objective_y(yp) - objective_y(ym)) / denom
+        return float(np.linalg.norm(grad, ord=np.inf))
+
+    # State tracking for the detailed callback table
+    iteration_state = {
+        'k': 0,
+        'x_prev': np.copy(x0),
+        'y_prev': np.copy(y0)
+    }
+    
+    # Print table header
+    header = (
+        f"\n{'Iter':>5}  {'Func-count':>10}  {'Fval':>14}  "
+        f"{'Feasibility':>12}  {'Step Length':>12}  "
+        f"{'Norm of step':>14}  {'First-order':>12}"
+    )
+    tqdm.write(header)
+    tqdm.write("-" * len(header))
 
     cons = [
-        {'type': 'ineq', 'fun': lambda x: evaluate(x)['constraints'][0]},
-        {'type': 'ineq', 'fun': lambda x: evaluate(x)['constraints'][1]},
-        {'type': 'ineq', 'fun': lambda x: evaluate(x)['constraints'][2]},
-        {'type': 'ineq', 'fun': lambda x: evaluate(x)['constraints'][3]},
+        {'type': 'ineq', 'fun': lambda y: constraints_y(y)[0]},
+        {'type': 'ineq', 'fun': lambda y: constraints_y(y)[1]},
+        {'type': 'ineq', 'fun': lambda y: constraints_y(y)[2]},
+        {'type': 'ineq', 'fun': lambda y: constraints_y(y)[3]},
     ]
     for i in range(N_NODES - 1):
-        # Two smooth directional constraints replace the non-differentiable abs():
-        #   D[i+1] - D[i] <=  MAX_ADJACENT_TAPER
-        #   D[i]   - D[i+1] <= MAX_ADJACENT_TAPER
-        cons.append({'type': 'ineq', 'fun': lambda x, idx=i: MAX_ADJACENT_TAPER - (x[idx + 1] - x[idx])})
-        cons.append({'type': 'ineq', 'fun': lambda x, idx=i: MAX_ADJACENT_TAPER + (x[idx + 1] - x[idx])})
+        cons.append({'type': 'ineq', 'fun': lambda y, idx=i: MAX_ADJACENT_TAPER - (y_to_x(y)[idx + 1] - y_to_x(y)[idx])})
+        cons.append({'type': 'ineq', 'fun': lambda y, idx=i: MAX_ADJACENT_TAPER + (y_to_x(y)[idx + 1] - y_to_x(y)[idx])})
 
-    def callback(xk):
-        iteration_state['k'] += 1
+    def callback(yk):
+        xk = y_to_x(yk)
         res_data = evaluate(xk)
-        progress.update(1)
-        D_nodes, _, draft, bm = _split_design(xk)
-        D_summary = ", ".join(f"{d:.1f}" for d in np.round(D_nodes, 1))
+        
+        # Calculate Feasibility: constraints are satisfied if >= 0. Violation is when < 0.
+        # We calculate the maximum violation (or 0.0 if completely feasible)
+        c_vals = res_data['constraints']
+        taper_vals = _taper_margins(xk[:N_NODES])
+        violations = [max(0.0, -c) for c in c_vals]
+        violations.extend(max(0.0, -c) for c in taper_vals)
+        feasibility = max(violations) if violations else 0.0
+        
+        # Step length is reported in scaled variables; norm of step is in physical variables.
+        step_length = np.linalg.norm(yk - iteration_state['y_prev'])
+        step_norm = np.linalg.norm(xk - iteration_state['x_prev'])
+        first_order = first_order_optimality(yk)
+        
+        # Print iteration details matching the specified layout
         tqdm.write(
-            f"[{stage_name} Iter {iteration_state['k']:02d}] "
-            f"Draft={draft:.1f}m | Ballast={bm/1e3:.1f}t | "
-            f"D=[{D_summary}] m | Mass={res_data['objective']:.1f} kg"
+            f"{iteration_state['k']:5d}  "
+            f"{feval_progress.n:10d}  "
+            f"{res_data['objective']:14.6e}  "
+            f"{feasibility:12.3e}  "
+            f"{step_length:12.3e}  "
+            f"{step_norm:14.3e}  "
+            f"{first_order:12.3e}"
         )
+        
+        # Update state for next step
+        iteration_state['k'] += 1
+        iteration_state['x_prev'] = np.copy(xk)
+        iteration_state['y_prev'] = np.copy(yk)
 
     # Evaluate at the initial point to prime the cache and record c0
     c0 = evaluate(x0)['constraints']
+    
+    # Print line for Iteration 0
+    c0_violations = [max(0.0, -c) for c in c0]
+    c0_violations.extend(max(0.0, -c) for c in _taper_margins(x0[:N_NODES]))
+    tqdm.write(
+        f"{0:5d}  "
+        f"{feval_progress.n:10d}  "
+        f"{evaluate(x0)['objective']:14.6e}  "
+        f"{max(c0_violations):12.3e}  "
+        f"{0.000e+00:12.3e}  "
+        f"{0.000e+00:14.3e}  "
+        f"{first_order_optimality(y0):12.3e}"
+    )
+    iteration_state['k'] = 1
 
     res = minimize(
-        objective, x0, method='SLSQP', bounds=bounds, constraints=cons, callback=callback,
-        options={'maxiter': maxiter, 'ftol': ftol, 'eps': 1e-5, 'disp': False}
+        objective_y, y0, method='SLSQP', bounds=y_bounds, constraints=cons, callback=callback,
+        options={'maxiter': maxiter, 'ftol': ftol, 'eps': 1e-4, 'disp': False}
     )
 
-    c_final = evaluate(res.x)['constraints']
+    res.x_scaled = np.copy(res.x)
+    res.x = y_to_x(res.x_scaled)
+    res.fun = objective(res.x)
+    res.jac = None
 
-    progress.close()
+    c_final = evaluate(res.x)['constraints']
     feval_progress.close()
+    
     return res, c0, c_final
 
 def print_summary(res, x0, title, c0, c_final):
@@ -459,12 +655,12 @@ def print_summary(res, x0, title, c0, c_final):
 
     # --- Constraints: un-normalise back to physical units ---
     # Convention: c[k] > 0 -> satisfied, c[k] = 0 -> active, c[k] < 0 -> violated
-    surge_0  = SURGE_RMS_MAX      * (1.0 - c0[0])
-    surge_f  = SURGE_RMS_MAX      * (1.0 - c_final[0])
-    pitch_0  = PITCH_RMS_MAX_DEG  * (1.0 - c0[1])
-    pitch_f  = PITCH_RMS_MAX_DEG  * (1.0 - c_final[1])
-    buoy_0   = c0[2]      * 1e6 + FLOATING_MARGIN
-    buoy_f   = c_final[2] * 1e6 + FLOATING_MARGIN
+    surge_0  = _dynamic_response_text(c0[0], SURGE_RMS_MAX)
+    surge_f  = _dynamic_response_text(c_final[0], SURGE_RMS_MAX)
+    pitch_0  = _dynamic_response_text(c0[1], PITCH_RMS_MAX_DEG)
+    pitch_f  = _dynamic_response_text(c_final[1], PITCH_RMS_MAX_DEG)
+    buoy_0   = f"{c0[2]      * BUOYANCY_SCALE + FLOATING_MARGIN:.3f}"
+    buoy_f   = f"{c_final[2] * BUOYANCY_SCALE + FLOATING_MARGIN:.3f}"
     gm_0     = c0[3]      * GM_MIN + GM_MIN
     gm_f     = c_final[3] * GM_MIN + GM_MIN
 
@@ -476,8 +672,8 @@ def print_summary(res, x0, title, c0, c_final):
         "> 0 kg",
         f"> {GM_MIN:.2f} m",
     ]
-    phys_init  = [surge_0, pitch_0, buoy_0, gm_0]
-    phys_final = [surge_f, pitch_f, buoy_f, gm_f]
+    phys_init  = [surge_0, pitch_0, buoy_0, f"{gm_0:.3f}"]
+    phys_final = [surge_f, pitch_f, buoy_f, f"{gm_f:.3f}"]
     ACTIVE_TOL = 0.05
 
     print(f"\n  {'Constraint':<18} {'Limit':<22} {'Initial':>12} {'Final':>12} {'Status':>10}")
@@ -490,7 +686,23 @@ def print_summary(res, x0, title, c0, c_final):
             status = "ACTIVE"
         else:
             status = "Inactive"
-        print(f"  {name:<18} {limit:<22} {pv0:>12.3f} {pvf:>12.3f} {status:>10}")
+        print(f"  {name:<18} {limit:<22} {pv0:>12} {pvf:>12} {status:>10}")
+
+    taper_0 = _taper_margins(D_0)
+    taper_f = _taper_margins(D_f)
+    taper_status = "VIOLATED" if np.any(taper_f < -ACTIVE_TOL) else ("ACTIVE" if np.any(np.abs(taper_f) <= ACTIVE_TOL) else "Inactive")
+    print(f"\n  {'Taper constraint':<18} {'Limit':<22} {'Initial':>12} {'Final':>12} {'Status':>10}")
+    print(f"  {'-'*78}")
+    print(
+        f"  {'Adjacent D step':<18} "
+        f"{'<= ' + format(MAX_ADJACENT_TAPER, '.2f') + ' m':<22} "
+        f"{np.min(taper_0):>12.3f} "
+        f"{np.min(taper_f):>12.3f} "
+        f"{taper_status:>10}"
+    )
+    if np.any(taper_f < -ACTIVE_TOL):
+        bad_pairs = [f"{i+1}-{i+2}" for i, margin in enumerate(taper_f) if margin < -ACTIVE_TOL]
+        print(f"  Violated adjacent pairs: {', '.join(bad_pairs)}")
 
     # --- Lagrange Multipliers / KKT information ---
     print(f"\n  Lagrange Multipliers / KKT information:")
@@ -507,7 +719,7 @@ def print_summary(res, x0, title, c0, c_final):
             [f"L_frac_{i+1}" for i in range(N_NODES)] +
             ["Draft", "BallastM"]
         )
-        print(f"  (Objective gradient df/dx at solution — active-constraint rows are the KKT proxy)")
+        print(f"  (Objective gradient df/dx at solution - active-constraint rows are the KKT proxy)")
         for lbl, g in zip(var_labels, jac):
             print(f"    {lbl:<28}: {g:>14.6e}")
     else:
@@ -559,20 +771,32 @@ def run():
     ballast_mass_bounds = [(MIN_BALLAST_MASS, MAX_BALLAST_MASS)]
     bounds = d_bounds + frac_bounds + draft_bounds + ballast_mass_bounds
 
-    # Initial stable anchor point
-    initial_diameters = [20.0, 7.0, 20.0, 18.0, 20.0, 15.0, 15.0, 12.0, 10.0, 8.0]
-    initial_fractions = [0.1] * N_NODES 
-    initial_draft = 140.0        # Deeper draft increases stability
-    initial_ballast_mass = 15e6  # 15,000 tonnes (Higher ballast)
-    
-    x0 = np.array([*initial_diameters, *initial_fractions, initial_draft, initial_ballast_mass], dtype=float)
-
     # Pre-compute shared 1200 s environment once — both stages reuse the same realisation
     print("[ENV] Loading or computing 1200 s environment (JONSWAP seed 2 / Kaimal seed 1)...")
     waves = _load_or_compute_waves()
     wind  = _load_or_compute_wind()
     print("[ENV] Environment ready.")
     plot_environment(waves, wind)
+
+    x0 = _select_initial_design(waves, wind)
+    buoy0, gm0, taper0 = _static_margins(x0)
+    print(
+        "[INIT] Static margins for selected design: "
+        f"buoyancy={buoy0:.3e} kg, GM={gm0:.3f} m, "
+        f"min taper margin={taper0:.3f} m"
+    )
+    stage1_move_limits = np.array(
+        [4.0] * N_NODES +
+        [0.08] * N_NODES +
+        [25.0, 5e6],
+        dtype=float
+    )
+    stage2_move_limits = np.array(
+        [2.0] * N_NODES +
+        [0.04] * N_NODES +
+        [12.5, 2.5e6],
+        dtype=float
+    )
 
     # =========================================================================
     # STAGE 1: COARSE & SWIFT DESIGN REGIME SWEEP (Saves ~75% Runtime)
@@ -583,8 +807,9 @@ def run():
         time_step=0.5,
         transient_time=150.0,
         maxiter=35,
-        ftol=1e-2,
-        stage_name="STAGE_1_COARSE"
+        ftol=1e-6,
+        stage_name="STAGE_1_COARSE",
+        move_limits=stage1_move_limits
     )
     print_summary(res_stage1, x0, "STAGE 1 RESULTS", c0_s1, cf_s1)
 
@@ -599,7 +824,8 @@ def run():
         transient_time=600.0,
         maxiter=15,
         ftol=1e-3,
-        stage_name="STAGE_2_FINE"
+        stage_name="STAGE_2_FINE",
+        move_limits=stage2_move_limits
     )
     print_summary(res_final, res_stage1.x, "STAGE 2 RESULTS", c0_s2, cf_s2)
 
