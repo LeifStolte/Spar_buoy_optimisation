@@ -32,7 +32,7 @@ ROTOR0 = loadFromJSON(ROTOR_JSON)
 GLOBAL_ROTOR = Rotor.from_mapping(ROTOR0)
 if not GLOBAL_ROTOR.ARotor:
     GLOBAL_ROTOR.ARotor = 0.25 * np.pi * (ROTOR0.get('DRotor', 0.0) ** 2)
-GLOBAL_ROTOR.gamma = 0.0
+GLOBAL_ROTOR.gamma = 0.5
 GLOBAL_ROTOR.active = True
 
 # =========================================================================
@@ -42,7 +42,7 @@ SURGE_RMS_MAX = 3000
 PITCH_RMS_MAX_DEG = 10
 GM_MIN = 0.5  
 FLOATING_MARGIN = 1e4 
-FIXED_THICKNESS = 0.08 
+FIXED_THICKNESS = 0.07
 N_NODES = 10
 
 # Natural period constraints
@@ -54,8 +54,7 @@ UPPER_BOUND_D = 20.0
 MIN_DRAFT = 50.0
 MAX_DRAFT = 200.0
 MIN_BALLAST_MASS = 0
-MAX_BALLAST_MASS = 4e7     # 10,000 tonnes
-MAX_ADJACENT_TAPER = 5  # max diameter change between adjacent nodes [m]
+MAX_BALLAST_MASS = 4e7     # 40,000 tonnes
 
 # =========================================================================
 # 3. HIGH-FIDELITY VECTOR TRANSFORMS & MATH UTILITIES
@@ -80,6 +79,26 @@ def _step_profile(values, n_points):
 
 def _design_key(x):
     return np.asarray(x, dtype=float).reshape(-1).tobytes()
+
+
+def _scale_bounds(bounds, scales):
+    return [(lo / scale, hi / scale) for (lo, hi), scale in zip(bounds, scales)]
+
+
+def _full_design_scales():
+    return np.array([10.0] * N_NODES + [0.1] * N_NODES + [100.0, 1e7], dtype=float)
+
+
+def _hydrostatic_scales():
+    return np.array([10.0, 10.0, 10.0, 100.0, 1e7], dtype=float)
+
+
+def _full_design_fd_step(stage_name):
+    return 1e-4 if "COARSE" in stage_name else 5e-5
+
+
+def _hydrostatic_fd_step():
+    return 1e-4
 
 
 def _natural_periods(structure):
@@ -107,9 +126,6 @@ def _plot_diameter_profile(ax, structure, diameters, label, style='-'):
     ax.axhline(0.0, color='k', linewidth=0.8, alpha=0.5)
 
 
-def _append_monotonic_taper_constraints(cons, start_idx, n_diameters):
-    for i in range(start_idx, start_idx + n_diameters - 1):
-        cons.append({'type': 'ineq', 'fun': lambda x, idx=i: x[idx] - x[idx + 1]})
 
 
 def _get_weight_distribution(structure, D_nodes, L_fracs, ballast_mass, thickness=FIXED_THICKNESS):
@@ -467,7 +483,6 @@ def execute_optimization_stage(x0, bounds, waves, wind, time_final, time_step, t
     ]
     
     cons.append({'type': 'eq', 'fun': lambda x: np.sum(x[N_NODES:2 * N_NODES]) - 1.0})
-    _append_monotonic_taper_constraints(cons, 0, N_NODES)
 
     def callback(xk):
         iteration_state['k'] += 1
@@ -481,7 +496,7 @@ def execute_optimization_stage(x0, bounds, waves, wind, time_final, time_step, t
         )
 
     _ = evaluate(x0)['constraints']
-    step_size = 1e-2 if "COARSE" in stage_name else 5e-3
+    step_size = 1e-5 if "COARSE" in stage_name else 5e-3
 
     res = minimize(
         objective, x0, method='SLSQP', bounds=bounds, constraints=cons, callback=callback,
@@ -568,6 +583,24 @@ def _simulate_pitch_response(x_design, waves, wind, time_final=_ENV_DURATION, ti
     return t_response, pitch_deg
 
 
+def _simulate_full_response(x_design, waves, wind, time_final=_ENV_DURATION, time_step=_ENV_DT):
+    D_nodes, L_fracs, draft, ballast_mass = _split_design(x_design)
+    structure = build_structure(draft, D_nodes, L_fracs, ballast_mass, SPAR0)
+
+    t_response = np.arange(0.0, float(time_final), float(time_step))
+    q0 = np.zeros(5)
+    q = ode4(floater_dqdt, t_response, q0, structure, GLOBAL_ROTOR, waves, wind)
+
+    rotor = GLOBAL_ROTOR.copy()
+    qdot = np.array([floater_dqdt(ti, qi, structure, rotor, waves, wind) for ti, qi in zip(t_response, q)])
+
+    top_deflection = q[:, 0] + structure.zhub * q[:, 1]
+    top_velocity = q[:, 2] + structure.zhub * q[:, 3]
+    top_acceleration = qdot[:, 2] + structure.zhub * qdot[:, 3]
+
+    return t_response, q, top_deflection, top_velocity, top_acceleration
+
+
 def save_pitch_response_comparison(x_stage0, x_stage1, x_stage2, waves, wind):
     out_dir = os.path.join(BASE, 'assignment5', 'python', 'outputFig')
     os.makedirs(out_dir, exist_ok=True)
@@ -588,6 +621,50 @@ def save_pitch_response_comparison(x_stage0, x_stage1, x_stage2, waves, wind):
     ax.legend(fontsize=9)
 
     fpath = os.path.join(out_dir, 'spar_pitch_response_all_stages.png')
+    fig.savefig(fpath, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    return fpath
+
+
+def save_top_response_comparison(x_stage0, x_stage1, x_stage2, waves, wind):
+    out_dir = os.path.join(BASE, 'assignment5', 'python', 'outputFig')
+    os.makedirs(out_dir, exist_ok=True)
+
+    t0, q0, top0, vel0, acc0 = _simulate_full_response(x_stage0, waves, wind)
+    t1, q1, top1, vel1, acc1 = _simulate_full_response(x_stage1, waves, wind)
+    tf, qf, topf, velf, accf = _simulate_full_response(x_stage2, waves, wind)
+
+    fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
+
+    axes[0].plot(t0, top0, '--', linewidth=1.1, label='Stage 0 Hydrostatic')
+    axes[0].plot(t1, top1, '-.', linewidth=1.1, label='Stage 1 Coarse')
+    axes[0].plot(tf, topf, '-', linewidth=1.3, label='Stage 2 Fine')
+    axes[0].set_ylabel('Top deflection [m]')
+    axes[0].set_title('Top Motion Response Comparison')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(fontsize=9)
+
+    axes[1].plot(t0, vel0, '--', linewidth=1.1)
+    axes[1].plot(t1, vel1, '-.', linewidth=1.1)
+    axes[1].plot(tf, velf, '-', linewidth=1.3)
+    axes[1].set_ylabel('Top velocity [m/s]')
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].plot(t0, acc0, '--', linewidth=1.1)
+    axes[2].plot(t1, acc1, '-.', linewidth=1.1)
+    axes[2].plot(tf, accf, '-', linewidth=1.3)
+    axes[2].set_ylabel('Top acceleration [m/s²]')
+    axes[2].grid(True, alpha=0.3)
+
+    axes[3].plot(t0, q0[:, 0], '--', linewidth=1.1)
+    axes[3].plot(t1, q1[:, 0], '-.', linewidth=1.1)
+    axes[3].plot(tf, qf[:, 0], '-', linewidth=1.3)
+    axes[3].set_ylabel('Surge [m]')
+    axes[3].set_xlabel('Time [s]')
+    axes[3].grid(True, alpha=0.3)
+
+    fpath = os.path.join(out_dir, 'spar_top_motion_response_all_stages.png')
+    fig.tight_layout()
     fig.savefig(fpath, dpi=200, bbox_inches='tight')
     plt.close(fig)
     return fpath
@@ -615,7 +692,6 @@ def run():
         {'type': 'ineq', 'fun': lambda x: hydrostatic_constraints(x)[2]},
         {'type': 'ineq', 'fun': lambda x: hydrostatic_constraints(x)[3]},
     ]
-    _append_monotonic_taper_constraints(cons_hydro, 0, 3)
     
     res_hydro = minimize(
         hydrostatic_objective, x0_hydro, method='SLSQP', bounds=bounds_hydro, 
@@ -696,11 +772,11 @@ def run():
     plt.close(fig)
 
     pitch_plot_path = save_pitch_response_comparison(x0, res_stage1.x, res_final.x, waves, wind)
+    top_plot_path = save_top_response_comparison(x0, res_stage1.x, res_final.x, waves, wind)
     print(f"\n[COMPLETE] Multi-stage process finished. Plots exported to: {fpath}")
     print(f"[COMPLETE] Pitch response comparison exported to: {pitch_plot_path}")
+    print(f"[COMPLETE] Top motion comparison exported to: {top_plot_path}")
 
 
 if __name__ == '__main__':
     run()
-
-
