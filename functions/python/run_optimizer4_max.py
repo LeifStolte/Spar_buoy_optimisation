@@ -13,7 +13,9 @@ from floaterIntegration import dqdt as floater_dqdt
 from models import Structure
 from rotor import Rotor
 
-# Input files
+# =========================================================================
+# 1. FILE PATHS & SETUP
+# =========================================================================
 BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 INPUT_VARS = os.path.join(BASE, 'assignment5', 'python', 'inputVariables')
 
@@ -33,22 +35,30 @@ if not GLOBAL_ROTOR.ARotor:
 GLOBAL_ROTOR.gamma = 0.0
 GLOBAL_ROTOR.active = True
 
-# Limits and model setup
-SURGE_RMS_MAX = 30 
-PITCH_RMS_MAX_DEG = 20
+# =========================================================================
+# 2. DESIGN LIMITS & OPTIMIZATION BOUNDS
+# =========================================================================
+SURGE_RMS_MAX = 3000 
+PITCH_RMS_MAX_DEG = 8
 GM_MIN = 0.5  
-FLOATING_MARGIN = 0.0  
-FIXED_THICKNESS = 0.05  
+FLOATING_MARGIN = 1e4 
+FIXED_THICKNESS = 0.09
 N_NODES = 10
 
-# Optimization Bounds
-UPPER_BOUND_D = 25.0
-MIN_DRAFT = 50.0
-MAX_DRAFT = 150.0
-MIN_BALLAST_MASS = 0.0
-MAX_BALLAST_MASS = 2e7     # 20 000 tonnes
-MAX_ADJACENT_TAPER = 2.5  # max diameter change between adjacent nodes [m]
+# Natural period constraints
+MIN_PITCH_PERIOD = 25.0
+MIN_HEAVE_PERIOD = 20.0
 
+# Optimization Bounds
+UPPER_BOUND_D = 20.0
+MIN_DRAFT = 50.0
+MAX_DRAFT = 150
+MIN_BALLAST_MASS = 5e6
+MAX_BALLAST_MASS = 4e7     # 40,000 tonnes
+
+# =========================================================================
+# 3. HIGH-FIDELITY VECTOR TRANSFORMS & MATH UTILITIES
+# =========================================================================
 def _split_design(x):
     x = np.asarray(x, dtype=float).reshape(-1)
     D_nodes = x[:N_NODES]
@@ -71,14 +81,54 @@ def _design_key(x):
     return np.asarray(x, dtype=float).reshape(-1).tobytes()
 
 
+def _scale_bounds(bounds, scales):
+    return [(lo / scale, hi / scale) for (lo, hi), scale in zip(bounds, scales)]
+
+
+def _full_design_scales():
+    return np.array([10.0] * N_NODES + [0.1] * N_NODES + [100.0, 1e7], dtype=float)
+
+
+def _hydrostatic_scales():
+    return np.array([10.0, 10.0, 10.0, 100.0, 1e7], dtype=float)
+
+
+def _full_design_fd_step(stage_name):
+    return 1e-4 if "COARSE" in stage_name else 5e-5
+
+
+def _hydrostatic_fd_step():
+    return 1e-4
+
+
+def _natural_periods(structure):
+    fnat = getattr(structure, 'fnat', None)
+    pitch_period = float('nan')
+    if fnat is not None and len(fnat) > 1 and np.isfinite(fnat[1]) and float(fnat[1]) > 0.0:
+        pitch_period = 1.0 / float(fnat[1])
+
+    heave_period = float('nan')
+    if getattr(structure, 'M', None) is not None:
+        waterplane_area = np.pi * (float(getattr(structure, 'DMonopile', 0.0)) / 2.0) ** 2
+        c_heave = float(getattr(structure, 'rho_Water', 1025.0)) * 9.81 * waterplane_area
+        added_heave = 0.5 * float(structure.buoyant_mass or 0.0)
+        mass_heave = float(structure.MTot or 0.0) + added_heave
+        if c_heave > 0.0 and mass_heave > 0.0:
+            heave_period = 2.0 * np.pi * np.sqrt(mass_heave / c_heave)
+
+    return pitch_period, heave_period
+
+
 def _plot_diameter_profile(ax, structure, diameters, label, style='-'):
     z_edges = np.asarray(structure.z_edges_computed, dtype=float)
     ax.step(diameters, z_edges[:-1], style, where='post', label=label)
     ax.set_ylim([min(z_edges) - 5, 5]) 
     ax.axhline(0.0, color='k', linewidth=0.8, alpha=0.5)
 
+
+
+
 def _get_weight_distribution(structure, D_nodes, L_fracs, ballast_mass, thickness=FIXED_THICKNESS):
-    """Cumulative mass from the bottom upward: steel shell + ballast lump at the lowest node."""
     D_nodes = np.asarray(D_nodes, dtype=float).reshape(-1)
     L_fracs = np.maximum(np.asarray(L_fracs, dtype=float), 1e-3)
     L_fracs /= np.sum(L_fracs)
@@ -105,7 +155,11 @@ def _get_weight_distribution(structure, D_nodes, L_fracs, ballast_mass, thicknes
     mass_per_section[0] += max(float(ballast_mass), 0.0)
 
     return z_edges[:-1], np.cumsum(mass_per_section)
-    
+
+
+# =========================================================================
+# 4. STRUCTURE FACTORY & OBJECTIVES
+# =========================================================================
 def build_structure(draft, D_nodes, L_fracs, ballast_mass, spar_template, thickness=FIXED_THICKNESS):
     s = Structure.from_mapping(spar_template)
     s.draft = float(draft)
@@ -140,10 +194,8 @@ def build_structure(draft, D_nodes, L_fracs, ballast_mass, spar_template, thickn
     section_masses = shell_area * rhos * section_lengths
 
     ms = float(np.sum(section_masses))
-    
     ballast_mass = float(max(ballast_mass, 0.0))
     s.M_Ballast = ballast_mass
-    
     mf = ms + ballast_mass
 
     mt = float(s.M_Tower or 0.0)
@@ -154,7 +206,6 @@ def build_structure(draft, D_nodes, L_fracs, ballast_mass, spar_template, thickn
     zCB = float(np.sum(section_volumes * z_mid) / buoyant_volume) if buoyant_volume > 0 else zbot / 2.0
     zCMs = float(np.sum(section_masses * z_mid) / ms) if ms > 0 else fb - ls / 2.0
     
-    # Ballast treated as a lump mass at the bottom node
     zballst = zbot
     s.Ballast_COG = zballst
     
@@ -201,6 +252,12 @@ def build_structure(draft, D_nodes, L_fracs, ballast_mass, spar_template, thickn
     s.mf = mf
     s.IAA = IAA
     s.z_edges_computed = z_edges  
+
+    s.fnat = np.array([
+        np.sqrt(max(s.C[0, 0], 1e-12) / max(s.A[0, 0] + s.M[0, 0], 1e-12)) / (2.0 * np.pi),
+        np.sqrt(max(s.C[1, 1], 1e-12) / max(s.A[1, 1] + s.M[1, 1], 1e-12)) / (2.0 * np.pi),
+    ], dtype=float)
+    s.Theave = 2.0 * np.pi * np.sqrt(max(mtot, 1e-12) / max(rhow * g * outer_area[-1], 1e-12))
     
     s.DProfile = _step_profile(D_nodes, 100)
     s.ThicknessProfile = np.full(100, float(thickness), dtype=float)
@@ -212,10 +269,11 @@ def build_structure(draft, D_nodes, L_fracs, ballast_mass, spar_template, thickn
 
     return s
 
+
 def objective(x):
     D_nodes, L_fracs, draft, ballast_mass = _split_design(x)
     s = build_structure(draft, D_nodes, L_fracs, ballast_mass, SPAR0)
-    return s.ms + s.M_Ballast
+    return (s.ms + s.M_Ballast)/1e7
 
 
 def constraints_fun(x, waves, wind, t_integration, transient_time, surge_rms_max=SURGE_RMS_MAX, pitch_rms_max_deg=PITCH_RMS_MAX_DEG):
@@ -227,20 +285,8 @@ def constraints_fun(x, waves, wind, t_integration, transient_time, surge_rms_max
     
     buoyancy_margin = s.buoyant_mass - s.MTot
     gm = (s.IAA / max(s.V_disp, 1e-9)) + s.zCB - s.zCM_Tot
+    pitch_period, heave_period = _natural_periods(s)
 
-    # If the design is physically impossible, use a large penalty to push it away
-    if buoyancy_margin < 0 or gm < GM_MIN:
-        # Increase these multipliers so the solver prioritizes stability over mass
-        buoy_penalty = min(buoyancy_margin, 0.0) / 1e3
-        gm_penalty = min(gm - GM_MIN, 0.0) * 1e4 
-        
-        return np.array([
-            -10.0, -10.0, # High penalty for instability so it stays away
-            (buoyancy_margin - FLOATING_MARGIN) / 1e6, 
-            (gm - GM_MIN) / GM_MIN
-        ])
-
-    # Integrated simulation pass using the pre-compiled global instance
     q0 = np.zeros(5)
     q = ode4(floater_dqdt, t_integration, q0, s, GLOBAL_ROTOR, waves, wind)
 
@@ -249,7 +295,7 @@ def constraints_fun(x, waves, wind, t_integration, transient_time, surge_rms_max
         post_transient = np.arange(len(t_integration)) >= int(0.5 * len(t_integration))
 
     if np.any(np.isnan(q)) or np.any(np.isinf(q)):
-        return np.array([-3.0, -3.0, (buoyancy_margin - FLOATING_MARGIN) / 1e6, (gm - GM_MIN) / GM_MIN])
+        return np.array([-3.0, -3.0, (buoyancy_margin - FLOATING_MARGIN) / 1e6, (gm - GM_MIN) / GM_MIN, -1.0, -1.0])
 
     surge_rms = np.sqrt(np.mean(q[post_transient, 0] ** 2))
     pitch_rms = np.sqrt(np.mean((np.rad2deg(q[post_transient, 1])) ** 2))
@@ -257,8 +303,10 @@ def constraints_fun(x, waves, wind, t_integration, transient_time, surge_rms_max
     return np.array([
         (surge_rms_max - surge_rms) / surge_rms_max,
         (pitch_rms_max_deg - pitch_rms) / pitch_rms_max_deg,
-        buoyancy_margin / 1e7,  # Assuming ~10,000 tonnes
-        (gm - GM_MIN) / GM_MIN
+        buoyancy_margin / 1e7,  
+        (gm - GM_MIN) / GM_MIN,
+        (pitch_period - MIN_PITCH_PERIOD) / MIN_PITCH_PERIOD if np.isfinite(pitch_period) else -1.0,
+        (heave_period - MIN_HEAVE_PERIOD) / MIN_HEAVE_PERIOD if np.isfinite(heave_period) else -1.0,
     ])
 
 
@@ -277,16 +325,15 @@ def _make_cached_evaluator(waves, wind, t_integration, transient_time, feval_pro
     return evaluate
 
 
-# ---------------------------------------------------------------------------
-# Environment cache helpers — single 1200 s realisation shared by both stages
-# ---------------------------------------------------------------------------
+# =========================================================================
+# 5. ENVIRONMENT GENERATION & DISK CACHING
+# =========================================================================
 _ENV_CACHE_DIR = os.path.join(BASE, 'assignment5', 'python', 'outputVariables')
-_ENV_DURATION  = 1200.0   # covers Stage 2; Stage 1 only uses the first 400 s
-_ENV_DT        = 1.0      # = 2 * time_step (time_step = 0.5 s)
+_ENV_DURATION  = 1200.0   
+_ENV_DT        = 1.0      
 
 
 def _env_cache_path(prefix, seed, **extra):
-    """Return a deterministic .npz path based on generation parameters."""
     os.makedirs(_ENV_CACHE_DIR, exist_ok=True)
     tag = f"{prefix}_T{_ENV_DURATION:.0f}_dt{_ENV_DT:.4f}_seed{seed}"
     for k, v in sorted(extra.items()):
@@ -295,7 +342,6 @@ def _env_cache_path(prefix, seed, **extra):
 
 
 def _load_or_compute_waves():
-    """Load or generate the 1200 s JONSWAP wave environment (cached to disk)."""
     Hs   = SPAR0.get('significant_wave', 6.0)
     Tp   = SPAR0.get('wave_period', 10.0)
     h    = TIME_INFO.get('water_depth', 320.0)
@@ -306,7 +352,7 @@ def _load_or_compute_waves():
     if os.path.exists(cache_file):
         d = np.load(cache_file)
         if 'eta' not in d.files:
-            os.remove(cache_file)  # stale cache without eta — regenerate
+            os.remove(cache_file)  
         else:
             return SimpleNamespace(t=d['t'], u=d['u'], ut=d['ut'], z=d['z'], eta=d['eta'])
 
@@ -326,7 +372,6 @@ def _load_or_compute_waves():
 
 
 def _load_or_compute_wind():
-    """Load or generate the 1200 s Kaimal wind environment (cached to disk)."""
     V_10 = SPAR0.get('wind_speed', 8.0)
     I    = TIME_INFO.get('turbulence_intensity', 0.05)
     l    = TIME_INFO.get('turbulence_length_scale', 340.2)
@@ -351,7 +396,6 @@ def _load_or_compute_wind():
 
 
 def plot_environment(waves, wind):
-    """Twin-axis time-series plot of wave elevation and hub wind speed over 1200 s."""
     out_dir = os.path.join(BASE, 'assignment5', 'python', 'outputFig')
     os.makedirs(out_dir, exist_ok=True)
 
@@ -367,11 +411,7 @@ def plot_environment(waves, wind):
     ax2.set_ylabel('Hub wind speed [m/s]', color='darkorange')
     ax1.tick_params(axis='y', labelcolor='steelblue')
     ax2.tick_params(axis='y', labelcolor='darkorange')
-    ax1.set_title(
-        f'Environmental conditions — {_ENV_DURATION:.0f} s realisation '
-        f'(JONSWAP Hs={SPAR0.get("significant_wave", 6.0):.1f} m, '
-        f'Kaimal V₁₀={SPAR0.get("wind_speed", 8.0):.1f} m/s)'
-    )
+    ax1.set_title('Environmental conditions Realisation')
     ax1.set_xlim(waves.t[0], waves.t[-1])
     lines  = ax1.get_lines() + ax2.get_lines()
     labels = [ln.get_label() for ln in lines]
@@ -382,13 +422,54 @@ def plot_environment(waves, wind):
     fpath = os.path.join(out_dir, 'environment_waves_wind_1200s_ro2.png')
     fig.savefig(fpath, dpi=200, bbox_inches='tight')
     plt.close(fig)
-    print(f"[ENV] Environment plot saved to {os.path.basename(fpath)}")
 
 
+# =========================================================================
+# 6. STAGE 0 FUNCTIONS (FAST HYDROSTATIC SEED FINDER)
+# =========================================================================
+def _split_simplified_design(x):
+    x = np.asarray(x, dtype=float).reshape(-1)
+    D_top, D_mid, D_bot = x[0], x[1], x[2]
+    draft = float(x[3])
+    ballast_mass = float(x[4])
+    
+    D_nodes = np.interp(np.linspace(0.0, 1.0, N_NODES), [0.0, 0.5, 1.0], [D_bot, D_mid, D_top])
+    L_fracs = np.full(N_NODES, 1.0 / N_NODES)
+    return D_nodes, L_fracs, draft, ballast_mass
+
+
+def hydrostatic_objective(x):
+    D_nodes, L_fracs, draft, ballast_mass = _split_simplified_design(x)
+    s = build_structure(draft, D_nodes, L_fracs, ballast_mass, SPAR0)
+    return (s.ms + s.M_Ballast) / 1e7
+
+
+def hydrostatic_constraints(x):
+    D_nodes, L_fracs, draft, ballast_mass = _split_simplified_design(x)
+    s = build_structure(draft, D_nodes, L_fracs, ballast_mass, SPAR0)
+    
+    buoyancy_margin = s.buoyant_mass - s.MTot
+    gm = (s.IAA / max(s.V_disp, 1e-9)) + s.zCB - s.zCM_Tot
+    pitch_period, heave_period = _natural_periods(s)
+    
+    return np.array([
+        buoyancy_margin / 1e7,                                                    
+        (gm - GM_MIN) / GM_MIN,                                                   
+        (pitch_period - MIN_PITCH_PERIOD) / MIN_PITCH_PERIOD if np.isfinite(pitch_period) else -1.0, 
+        (heave_period - MIN_HEAVE_PERIOD) / MIN_HEAVE_PERIOD if np.isfinite(heave_period) else -1.0  
+    ])
+
+
+# =========================================================================
+# 7. MULTI-STAGE SOLVER RUNTIME ENGINE
+# =========================================================================
 def execute_optimization_stage(x0, bounds, waves, wind, time_final, time_step, transient_time, maxiter, ftol, stage_name):
-    """Execute one optimisation stage using a pre-computed shared environment."""
     t_integration = np.arange(0.0, time_final, 2.0 * time_step)
     print(f"\n[{stage_name}] Starting (T={time_final:.0f}s, {maxiter} iter max, ftol={ftol})...")
+
+    scales = _full_design_scales()
+    y0 = np.asarray(x0, dtype=float) / scales
+    scaled_bounds = _scale_bounds(bounds, scales)
 
     feval_progress = tqdm(desc=f'{stage_name} Evals', unit='eval')
     evaluate = _make_cached_evaluator(waves, wind, t_integration, transient_time, feval_progress)
@@ -397,269 +478,258 @@ def execute_optimization_stage(x0, bounds, waves, wind, time_final, time_step, t
     progress = tqdm(total=maxiter, desc=f'{stage_name} Main Loop', unit='iter')
 
     cons = [
-        {'type': 'ineq', 'fun': lambda x: evaluate(x)['constraints'][0]},
-        {'type': 'ineq', 'fun': lambda x: evaluate(x)['constraints'][1]},
-        {'type': 'ineq', 'fun': lambda x: evaluate(x)['constraints'][2]},
-        {'type': 'ineq', 'fun': lambda x: evaluate(x)['constraints'][3]},
+        {'type': 'ineq', 'fun': lambda y: evaluate(y * scales)['constraints'][0]},
+        {'type': 'ineq', 'fun': lambda y: evaluate(y * scales)['constraints'][1]},
+        {'type': 'ineq', 'fun': lambda y: evaluate(y * scales)['constraints'][2]},
+        {'type': 'ineq', 'fun': lambda y: evaluate(y * scales)['constraints'][3]},
+        {'type': 'ineq', 'fun': lambda y: evaluate(y * scales)['constraints'][4]},
+        {'type': 'ineq', 'fun': lambda y: evaluate(y * scales)['constraints'][5]},
     ]
-    for i in range(N_NODES - 1):
-        # Two smooth directional constraints replace the non-differentiable abs():
-        #   D[i+1] - D[i] <=  MAX_ADJACENT_TAPER
-        #   D[i]   - D[i+1] <= MAX_ADJACENT_TAPER
-        cons.append({'type': 'ineq', 'fun': lambda x, idx=i: MAX_ADJACENT_TAPER - (x[idx + 1] - x[idx])})
-        cons.append({'type': 'ineq', 'fun': lambda x, idx=i: MAX_ADJACENT_TAPER + (x[idx + 1] - x[idx])})
+    
+    cons.append({
+        'type': 'eq',
+        'fun': lambda y: np.sum(y[N_NODES:2 * N_NODES] * scales[N_NODES:2 * N_NODES]) - 1.0
+    })
 
-    def callback(xk):
+    def callback(yk):
         iteration_state['k'] += 1
+        xk = yk * scales
         res_data = evaluate(xk)
         progress.update(1)
-        D_nodes, _, draft, bm = _split_design(xk)
-        D_summary = ", ".join(f"{d:.1f}" for d in np.round(D_nodes, 1))
+        _, _, draft, bm = _split_design(xk)
         tqdm.write(
             f"[{stage_name} Iter {iteration_state['k']:02d}] "
             f"Draft={draft:.1f}m | Ballast={bm/1e3:.1f}t | "
-            f"D=[{D_summary}] m | Mass={res_data['objective']:.1f} kg"
+            f"Mass={res_data['objective'] * 1e7 / 1e3:.1f} tonnes"
         )
 
-    # Evaluate at the initial point to prime the cache and record c0
-    c0 = evaluate(x0)['constraints']
+    _ = evaluate(x0)['constraints']
+    step_size = _full_design_fd_step(stage_name)
 
     res = minimize(
-        objective, x0, method='SLSQP', bounds=bounds, constraints=cons, callback=callback,
-        options={'maxiter': maxiter, 'ftol': ftol, 'eps': 1e-5, 'disp': False}
+        lambda y: objective(y * scales), y0, method='SLSQP',
+        bounds=scaled_bounds, constraints=cons, callback=callback,
+        options={'maxiter': maxiter, 'ftol': ftol, 'eps': step_size, 'disp': False}
     )
+    res.x = res.x * scales
 
     c_final = evaluate(res.x)['constraints']
-
     progress.close()
     feval_progress.close()
-    return res, c0, c_final
+    return res, evaluate(x0)['constraints'], c_final
 
+
+# =========================================================================
+# 8. POST-PROCESSING & GRAPH UTILITIES
+# =========================================================================
 def print_summary(res, x0, title, c0, c_final):
-    D_f, L_f, dr_f, bm_f = _split_design(res.x)
-    D_0, L_0, dr_0, bm_0 = _split_design(x0)
-
-    s0 = build_structure(dr_0, D_0, L_0, bm_0, SPAR0)
-    sf = build_structure(dr_f, D_f, L_f, bm_f, SPAR0)
+    D_f, _, dr_f, bm_f = _split_design(res.x)
+    D_0, _, dr_0, bm_0 = _split_design(x0)
 
     sep = '=' * 74
-    print(f"\n{sep}")
-    print(f"  {title}")
-    print(sep)
-
-    # --- Design Variables ---
+    print(f"\n{sep}\n  {title}\n{sep}")
     print(f"\n  {'Parameter':<30} {'Initial':>16} {'Final':>16}")
     print(f"  {'-'*64}")
     print(f"  {'Draft [m]':<30} {dr_0:>16.3f} {dr_f:>16.3f}")
-    print(f"  {'Ballast mass [kg]':<30} {bm_0:>16.1f} {bm_f:>16.1f}")
-    for i in range(N_NODES):
-        print(f"  {'D_node_' + str(i+1) + ' [m]':<30} {D_0[i]:>16.4f} {D_f[i]:>16.4f}")
-    for i in range(N_NODES):
-        print(f"  {'L_frac_' + str(i+1):<30} {L_0[i]:>16.5f} {L_f[i]:>16.5f}")
+    print(f"  {'Ballast mass [tonnes]':<30} {bm_0/1e3:>16.1f} {bm_f/1e3:>16.1f}")
+    print(f"  {'-'*64}")
+    for idx, (d0, df) in enumerate(zip(D_0, D_f)):
+        print(f"  {f'Node {idx+1} Diameter [m]':<30} {d0:>16.2f} {df:>16.2f}")
+    surge_0, surge_f  = SURGE_RMS_MAX * (1.0 - c0[0]), SURGE_RMS_MAX * (1.0 - c_final[0])
+    pitch_0, pitch_f  = PITCH_RMS_MAX_DEG * (1.0 - c0[1]), PITCH_RMS_MAX_DEG * (1.0 - c_final[1])
+    buoy_0, buoy_f    = c0[2] * 1e7, c_final[2] * 1e7
+    gm_0, gm_f        = c0[3] * GM_MIN + GM_MIN, c_final[3] * GM_MIN + GM_MIN
+    pitchT_0, pitchT_f = MIN_PITCH_PERIOD * (1.0 + c0[4]), MIN_PITCH_PERIOD * (1.0 + c_final[4])
+    heaveT_0, heaveT_f = MIN_HEAVE_PERIOD * (1.0 + c0[5]), MIN_HEAVE_PERIOD * (1.0 + c_final[5])
 
-    # --- Constraints: un-normalise back to physical units ---
-    # Convention: c[k] > 0 -> satisfied, c[k] = 0 -> active, c[k] < 0 -> violated
-    surge_0  = SURGE_RMS_MAX      * (1.0 - c0[0])
-    surge_f  = SURGE_RMS_MAX      * (1.0 - c_final[0])
-    pitch_0  = PITCH_RMS_MAX_DEG  * (1.0 - c0[1])
-    pitch_f  = PITCH_RMS_MAX_DEG  * (1.0 - c_final[1])
-    buoy_0   = c0[2]      * 1e6 + FLOATING_MARGIN
-    buoy_f   = c_final[2] * 1e6 + FLOATING_MARGIN
-    gm_0     = c0[3]      * GM_MIN + GM_MIN
-    gm_f     = c_final[3] * GM_MIN + GM_MIN
-
-    CON_NAMES  = ["Surge RMS", "Pitch RMS", "Buoyancy", "GM (stability)"]
-    CON_UNITS  = ["m", "deg", "kg", "m"]
-    CON_LIMITS = [
-        f"<= {SURGE_RMS_MAX:.1f} m",
-        f"<= {PITCH_RMS_MAX_DEG:.1f} deg",
-        "> 0 kg",
-        f"> {GM_MIN:.2f} m",
-    ]
-    phys_init  = [surge_0, pitch_0, buoy_0, gm_0]
-    phys_final = [surge_f, pitch_f, buoy_f, gm_f]
-    ACTIVE_TOL = 0.05
+    CON_NAMES  = ["Surge RMS", "Pitch RMS", "Buoyancy Margin", "GM Height", "Pitch Period", "Heave Period"]
+    CON_LIMITS = [f"<= {SURGE_RMS_MAX}m", f"<= {PITCH_RMS_MAX_DEG}°", "> 0 kg", f">= {GM_MIN}m", f">= {MIN_PITCH_PERIOD}s", f">= {MIN_HEAVE_PERIOD}s"]
+    phys_init  = [surge_0, pitch_0, buoy_0, gm_0, pitchT_0, heaveT_0]
+    phys_final = [surge_f, pitch_f, buoy_f, gm_f, pitchT_f, heaveT_f]
 
     print(f"\n  {'Constraint':<18} {'Limit':<22} {'Initial':>12} {'Final':>12} {'Status':>10}")
     print(f"  {'-'*78}")
-    for name, limit, unit, pv0, pvf, cvf in zip(
-            CON_NAMES, CON_LIMITS, CON_UNITS, phys_init, phys_final, c_final):
-        if cvf < -ACTIVE_TOL:
-            status = "VIOLATED"
-        elif abs(cvf) <= ACTIVE_TOL:
-            status = "ACTIVE"
-        else:
-            status = "Inactive"
-        print(f"  {name:<18} {limit:<22} {pv0:>12.3f} {pvf:>12.3f} {status:>10}")
-
-    # --- Lagrange Multipliers / KKT information ---
-    print(f"\n  Lagrange Multipliers / KKT information:")
-    print(f"  {'-'*52}")
-    if hasattr(res, 'v') and res.v is not None:
-        lm_vals = np.asarray(res.v).reshape(-1)
-        lm_labels = CON_NAMES[:len(lm_vals)]
-        for lbl, mu in zip(lm_labels, lm_vals):
-            print(f"    {lbl:<28}: {mu:>14.6e}")
-    elif hasattr(res, 'jac') and res.jac is not None:
-        jac = np.asarray(res.jac).reshape(-1)
-        var_labels = (
-            [f"D_node_{i+1}" for i in range(N_NODES)] +
-            [f"L_frac_{i+1}" for i in range(N_NODES)] +
-            ["Draft", "BallastM"]
-        )
-        print(f"  (Objective gradient df/dx at solution — active-constraint rows are the KKT proxy)")
-        for lbl, g in zip(var_labels, jac):
-            print(f"    {lbl:<28}: {g:>14.6e}")
-    else:
-        print("    Not available from solver.")
-
+    for name, limit, pv0, pvf, cvf in zip(CON_NAMES, CON_LIMITS, phys_init, phys_final, c_final):
+        status = "VIOLATED" if cvf < -0.05 else ("ACTIVE" if abs(cvf) <= 0.05 else "Inactive")
+        print(f"  {name:<18} {limit:<22} {pv0:>12.2f} {pvf:>12.2f} {status:>10}")
     print(sep)
 
+
 def save_results_plot(res, x0, stage_name):
-    """Saves diameter and mass plots for a given optimization result."""
     D, L, dr, b = _split_design(res.x)
     D0, L0, dr0, b0 = _split_design(x0)
     s = build_structure(dr, D, L, b, SPAR0)
     s0 = build_structure(dr0, D0, L0, b0, SPAR0)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    
-    # Diameter Profile
     _plot_diameter_profile(axes[0], s0, D0, 'Initial', style='--')
     _plot_diameter_profile(axes[0], s, D, 'Final', style='-')
     axes[0].set_xlabel('Diameter [m]')
     axes[0].set_ylabel('Elevation z [m]')
-    axes[0].set_title(f'Diameter profile: {stage_name}')
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 
-    # Cumulative mass distribution
     z, m = _get_weight_distribution(s, D, L, b)
     z0, m0 = _get_weight_distribution(s0, D0, L0, b0)
     axes[1].step(m0 / 1e3, z0, '--', where='post', label='Initial')
     axes[1].step(m  / 1e3, z,  '-',  where='post', label='Final')
     axes[1].set_xlabel('Cumulative mass [tonnes]')
-    axes[1].set_ylabel('Elevation z [m]')
-    axes[1].set_title(f'Cumulative mass: {stage_name}')
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
 
     out_dir = os.path.join(BASE, 'assignment5', 'python', 'outputFig')
-    os.makedirs(out_dir, exist_ok=True)
-    fname = f'spar_diameter_and_mass_{stage_name.lower()}_ro2.png'
-    fig.savefig(os.path.join(out_dir, fname), dpi=200, bbox_inches='tight')
+    fig.savefig(os.path.join(out_dir, f'spar_{stage_name.lower()}.png'), dpi=200, bbox_inches='tight')
     plt.close(fig)
 
 
-def run():
-    # --- BOUNDS DEFINITION ---
-    d_bounds = [(4.0, UPPER_BOUND_D)] * N_NODES 
-    frac_bounds = [(0.03, 0.35)] * N_NODES  
-    draft_bounds = [(MIN_DRAFT, MAX_DRAFT)]
-    ballast_mass_bounds = [(MIN_BALLAST_MASS, MAX_BALLAST_MASS)]
-    bounds = d_bounds + frac_bounds + draft_bounds + ballast_mass_bounds
+def _simulate_pitch_response(x_design, waves, wind, time_final=_ENV_DURATION, time_step=_ENV_DT):
+    D_nodes, L_fracs, draft, ballast_mass = _split_design(x_design)
+    structure = build_structure(draft, D_nodes, L_fracs, ballast_mass, SPAR0)
 
-    # Initial stable anchor point
-    initial_diameters = [20.0, 7.0, 20.0, 18.0, 20.0, 15.0, 15.0, 12.0, 10.0, 8.0]
-    initial_fractions = [0.1] * N_NODES 
-    initial_draft = 140.0        # Deeper draft increases stability
-    initial_ballast_mass = 15e6  # 15,000 tonnes (Higher ballast)
-    
-    x0 = np.array([*initial_diameters, *initial_fractions, initial_draft, initial_ballast_mass], dtype=float)
+    t_response = np.arange(0.0, float(time_final), float(time_step))
+    q0 = np.zeros(5)
+    q = ode4(floater_dqdt, t_response, q0, structure, GLOBAL_ROTOR, waves, wind)
+    pitch_deg = np.rad2deg(q[:, 1])
+    return t_response, pitch_deg
 
-    # Pre-compute shared 1200 s environment once — both stages reuse the same realisation
-    print("[ENV] Loading or computing 1200 s environment (JONSWAP seed 2 / Kaimal seed 1)...")
-    waves = _load_or_compute_waves()
-    wind  = _load_or_compute_wind()
-    print("[ENV] Environment ready.")
-    plot_environment(waves, wind)
 
-    # =========================================================================
-    # STAGE 1: COARSE & SWIFT DESIGN REGIME SWEEP (Saves ~75% Runtime)
-    # =========================================================================
-    res_stage1, c0_s1, cf_s1 = execute_optimization_stage(
-        x0=x0, bounds=bounds, waves=waves, wind=wind,
-        time_final=400.0,
-        time_step=0.5,
-        transient_time=150.0,
-        maxiter=35,
-        ftol=1e-2,
-        stage_name="STAGE_1_COARSE"
-    )
-    print_summary(res_stage1, x0, "STAGE 1 RESULTS", c0_s1, cf_s1)
-
-    # =========================================================================
-    # STAGE 2: HIGH-FIDELITY STRUCTURAL POLISH
-    # =========================================================================
-    print("\n[STAGE 2] Starting high-fidelity refinement from Stage 1 solution...")
-    res_final, c0_s2, cf_s2 = execute_optimization_stage(
-        x0=res_stage1.x, bounds=bounds, waves=waves, wind=wind,
-        time_final=1200.0,
-        time_step=0.5,
-        transient_time=600.0,
-        maxiter=15,
-        ftol=1e-3,
-        stage_name="STAGE_2_FINE"
-    )
-    print_summary(res_final, res_stage1.x, "STAGE 2 RESULTS", c0_s2, cf_s2)
-
-    sep = '=' * 74
-    print(f"\n{sep}")
-    print(f"  OPTIMIZATION COMPLETE")
-    print(f"  {res_final.message}")
-    print(sep)
-
+def save_pitch_response_comparison(x_stage0, x_stage1, x_stage2, waves, wind):
     out_dir = os.path.join(BASE, 'assignment5', 'python', 'outputFig')
     os.makedirs(out_dir, exist_ok=True)
 
-    # --- Per-stage plots ---
-    save_results_plot(res_stage1, x0,        "stage1_coarse")
-    save_results_plot(res_final,  res_stage1.x, "stage2_fine")
+    t0, p0 = _simulate_pitch_response(x_stage0, waves, wind)
+    t1, p1 = _simulate_pitch_response(x_stage1, waves, wind)
+    tf, pf = _simulate_pitch_response(x_stage2, waves, wind)
 
-    # --- Three-way comparison plot (Initial / Stage-1 / Stage-2) ---
-    D_stage1, L_stage1, dr_stage1, b_stage1 = _split_design(res_stage1.x)
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(t0, p0, '--', linewidth=1.1, label='Stage 0 Hydrostatic')
+    ax.plot(t1, p1, '-.', linewidth=1.1, label='Stage 1 Coarse')
+    ax.plot(tf, pf, '-', linewidth=1.3, label='Stage 2 Fine')
+    ax.axhline(0.0, color='k', linewidth=0.8, alpha=0.3)
+    ax.set_xlabel('Time [s]')
+    ax.set_ylabel('Pitch response [deg]')
+    ax.set_title('Pitch Response Comparison in Turbulent Wind and Irregular Waves')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
+
+    fpath = os.path.join(out_dir, 'spar_pitch_response_all_stages.png')
+    fig.savefig(fpath, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    return fpath
+
+
+# =========================================================================
+# 9. CENTRAL COORDINATOR RUN PIPELINE
+# =========================================================================
+def run():
+    # Setup 22-variable vector bounds
+    bounds = ([(4.0, UPPER_BOUND_D)] * N_NODES + 
+              [(0.03, 0.35)] * N_NODES + 
+              [(MIN_DRAFT, MAX_DRAFT)] + 
+              [(MIN_BALLAST_MASS, MAX_BALLAST_MASS)])
+
+    # =========================================================================
+    # STAGE 0: FAST HYDROSTATIC SEED SWEAK
+    # =========================================================================
+    print("\n[STAGE 0] Executing Pure Hydrostatic Pre-Optimization Sweep...")
+    x0_hydro = np.array([12.0, 12.0, 12.0, 100.0, 1.5e7])
+    bounds_hydro = [
+        (4.0, UPPER_BOUND_D), (4.0, UPPER_BOUND_D), (4.0, UPPER_BOUND_D),
+        (MIN_DRAFT, MAX_DRAFT), (MIN_BALLAST_MASS, MAX_BALLAST_MASS)
+    ]
+    hydro_scales = _hydrostatic_scales()
+    y0_hydro = x0_hydro / hydro_scales
+    scaled_bounds_hydro = _scale_bounds(bounds_hydro, hydro_scales)
+    cons_hydro = [
+        {'type': 'ineq', 'fun': lambda y: hydrostatic_constraints(y * hydro_scales)[0]},
+        {'type': 'ineq', 'fun': lambda y: hydrostatic_constraints(y * hydro_scales)[1]},
+        {'type': 'ineq', 'fun': lambda y: hydrostatic_constraints(y * hydro_scales)[2]},
+        {'type': 'ineq', 'fun': lambda y: hydrostatic_constraints(y * hydro_scales)[3]},
+    ]
+    
+    res_hydro = minimize(
+        lambda y: hydrostatic_objective(y * hydro_scales), y0_hydro, method='SLSQP',
+        bounds=scaled_bounds_hydro, constraints=cons_hydro,
+        options={'maxiter': 40, 'ftol': 1e-5, 'eps': _hydrostatic_fd_step(), 'disp': False}
+    )
+    res_hydro.x = res_hydro.x * hydro_scales
+    
+    if res_hydro.success:
+        print("[STAGE 0] Hydrostatic seed converged beautifully. Mapping to 22 variables...")
+        D_hyd, L_hyd, dr_hyd, bm_hyd = _split_simplified_design(res_hydro.x)
+        x0 = np.array([*D_hyd, *L_hyd, dr_hyd, bm_hyd], dtype=float)
+    else:
+        print("[WARNING] Stage 0 failed. Falling back to simple cylinders.")
+        x0 = np.array([*[20.0]*N_NODES, *[0.1]*N_NODES, 100.0, 1.5e7], dtype=float)
+
+    # Environmental setup
+    waves = _load_or_compute_waves()
+    wind  = _load_or_compute_wind()
+    plot_environment(waves, wind)
+
+    # =========================================================================
+    # STAGE 1: TIME DOMAIN COARSE ENGINE
+    # =========================================================================
+    res_stage1, c0_s1, cf_s1 = execute_optimization_stage(
+        x0=x0, bounds=bounds, waves=waves, wind=wind,
+        time_final=400.0, time_step=0.5, transient_time=150.0,
+        maxiter=100, ftol=1e-6, stage_name="STAGE_1_COARSE"
+    )
+    print_summary(res_stage1, x0, "STAGE 1 COARSE RESULTS", c0_s1, cf_s1)
+
+    # =========================================================================
+    # STAGE 2: HIGH-FIDELITY REFINEMENT POLISH
+    # =========================================================================
+    res_final, c0_s2, cf_s2 = execute_optimization_stage(
+        x0=res_stage1.x, bounds=bounds, waves=waves, wind=wind,
+        time_final=1200.0, time_step=0.5, transient_time=600.0,
+        maxiter=200, ftol=1e-7, stage_name="STAGE_2_FINE"
+    )
+    print_summary(res_final, res_stage1.x, "STAGE 2 FINE RESULTS", c0_s2, cf_s2)
+
+    # Save outputs and plots
+    save_results_plot(res_stage1, x0, "stage1_coarse")
+    save_results_plot(res_final, res_stage1.x, "stage2_fine")
+
+    # --- Three-way comparison plot generation ---
     D0, L0, dr0, b0 = _split_design(x0)
+    D1, L1, dr1, b1 = _split_design(res_stage1.x)
     Df, Lf, drf, bf = _split_design(res_final.x)
 
-    s0 = build_structure(dr0,       D0,       L0,       b0,       SPAR0)
-    s1 = build_structure(dr_stage1, D_stage1, L_stage1, b_stage1, SPAR0)
-    sf = build_structure(drf,       Df,       Lf,       bf,       SPAR0)
+    s0 = build_structure(dr0, D0, L0, b0, SPAR0)
+    s1 = build_structure(dr1, D1, L1, b1, SPAR0)
+    sf = build_structure(drf, Df, Lf, bf, SPAR0)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    _plot_diameter_profile(axes[0], s0, D0, f'Stage 0 Hydrostatic (Draft={dr0:.1f}m)', style='--')
+    _plot_diameter_profile(axes[0], s1, D1, f'Stage 1 Coarse (Draft={dr1:.1f}m)', style='-.')
+    _plot_diameter_profile(axes[0], sf, Df, f'Stage 2 Fine Polish (Draft={drf:.1f}m)', style='-')
+    axes[0].set_xlabel('Diameter [m]')
+    axes[0].set_ylabel('Elevation z [m]')
+    axes[0].set_title('Diameter Taper Profile Progression')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(fontsize=9)
 
-    ax_d = axes[0]
-    _plot_diameter_profile(ax_d, s0, D0,       f'Initial guess  (draft={dr0:.0f} m)',       style='--')
-    _plot_diameter_profile(ax_d, s1, D_stage1, f'Stage 1 coarse (draft={dr_stage1:.0f} m)', style='-.')
-    _plot_diameter_profile(ax_d, sf, Df,       f'Stage 2 fine   (draft={drf:.0f} m)',       style='-')
-    ax_d.set_xlabel('Diameter [m]')
-    ax_d.set_ylabel('Elevation z [m]')
-    ax_d.set_title('Diameter profile — all stages')
-    ax_d.set_ylim(float(s0.z_edges_computed[0]), 0.0)
-    ax_d.grid(True, alpha=0.3)
-    ax_d.legend(fontsize=9)
+    z0, m0 = _get_weight_distribution(s0, D0, L0, b0)
+    z1, m1 = _get_weight_distribution(s1, D1, L1, b1)
+    zf, mf_w = _get_weight_distribution(sf, Df, Lf, bf)
+    axes[1].step(m0 / 1e3, z0, '--', where='post', label='Stage 0')
+    axes[1].step(m1 / 1e3, z1, '-.', where='post', label='Stage 1 Coarse')
+    axes[1].step(mf_w / 1e3, zf, '-', where='post', label='Stage 2 Fine')
+    axes[1].set_xlabel('Cumulative Mass [tonnes]')
+    axes[1].set_ylabel('Elevation z [m]')
+    axes[1].set_title('Cumulative Structural Weight Distribution')
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(fontsize=9)
 
-    ax_w = axes[1]
-    z0, m0 = _get_weight_distribution(s0, D0,       L0,       b0)
-    z1, m1 = _get_weight_distribution(s1, D_stage1, L_stage1, b_stage1)
-    zf, mf_w = _get_weight_distribution(sf, Df,     Lf,       bf)
-    ax_w.step(m0   / 1e3, z0, '--', where='post', label='Initial guess',  linewidth=2)
-    ax_w.step(m1   / 1e3, z1, '-.',  where='post', label='Stage 1 coarse', linewidth=2)
-    ax_w.step(mf_w / 1e3, zf, '-',   where='post', label='Stage 2 fine',   linewidth=2)
-    ax_w.axhline(0.0, color='k', linewidth=0.8, alpha=0.25)
-    ax_w.set_xlabel('Cumulative mass [tonnes]')
-    ax_w.set_ylabel('Elevation z [m]')
-    ax_w.set_title('Cumulative mass distribution — steel + ballast')
-    ax_w.set_ylim(float(s0.z_edges_computed[0]), 0.0)
-    ax_w.grid(True, alpha=0.3)
-    ax_w.legend(fontsize=9)
-
-    fig.suptitle('Spar buoy optimisation — multi-stage comparison', fontsize=12)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, 'spar_multistage_diameter_and_mass_ro2.png'), dpi=200, bbox_inches='tight')
+    out_dir = os.path.join(BASE, 'assignment5', 'python', 'outputFig')
+    fpath = os.path.join(out_dir, 'spar_comparison_all_stages.png')
+    fig.savefig(fpath, dpi=200, bbox_inches='tight')
     plt.close(fig)
-    print(f"Figures saved to: {out_dir}")
 
-    return res_final
+    pitch_plot_path = save_pitch_response_comparison(x0, res_stage1.x, res_final.x, waves, wind)
+    print(f"\n[COMPLETE] Multi-stage process finished. Plots exported to: {fpath}")
+    print(f"[COMPLETE] Pitch response comparison exported to: {pitch_plot_path}")
 
 
 if __name__ == '__main__':
